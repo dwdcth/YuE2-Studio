@@ -3,6 +3,18 @@
 What changed, newest first. Dates are release dates; the studio is versioned by its
 Windows build.
 
+## Unreleased — this fork (linux-headless)
+
+### Added
+
+- **The standalone service as a headless server** (`YUE_STUDIO_HEADLESS=1` with `music-server`, or any start that carries the variable): the service listens on every address with the access key on, whatever the settings file says, and prints the addresses and the key into its console; the file keeps the user's own network switch, only a key made for the run is written back. An agent connects over MCP with the key as a bearer token.
+
+### Fixed
+
+- **A settings file written by hand is read as a whole**: a `studio-settings.json` with only `{"network": {"enabled": true}}` — the smallest file that reaches a studio from the network — failed to parse as a whole and was silently ignored, every switch in it with it.
+- **SIGTERM stops the service cleanly**: `systemctl stop` and `docker stop` ended a standalone service mid-flight; songs being made now stop where they are and are not made again at the next start, and the engine is shut down with the card released.
+- **Choosing the engine executable without a display**: `/engine/pick-executable` takes a `{"path": ...}` body, for an agent or a curl, and a studio with no display says so instead of answering that nothing was picked; "open the data directory" answers with the path when it has no file manager to open.
+
 ## 2026-11-16 — 4.1.0
 
 ### Added
