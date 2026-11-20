@@ -48,6 +48,18 @@ old_pin 变了 → PATH=/usr/local/cuda/bin:$PATH \
 # 5. 重启服务（用 systemd 或手工）
 ```
 
+**本机部署架构（2026-11-20 定型）**：Rust 后台服务 + vite 出 UI，不用 desktop 壳。
+
+```bash
+# 服务（0.0.0.0:8791，无头网络强制，引擎 CUDA）
+YUE_STUDIO_HEADLESS=1 YUE_ENGINE_ROOT=$HOME/yue2-engine \
+  ~/.cargo-target/yue2-studio/release/music-server &
+
+# UI（0.0.0.0:3791，浏览器从局域网直接开 http://<机器IP>:3791；
+# 代理已把 Origin 改写为 loopback 过服务端守卫，见 app/vite.config.ts）
+cd app && npm run dev &
+```
+
 desktop 壳（浏览器 UI 的 `--headless` 二进制）只在界面代码变了时才值得重建：
 `cd desktop/src-tauri && cargo build --release`（注意它用独立的
 `CARGO_TARGET_DIR=$HOME/.cargo-target/yue2-desktop`）。
