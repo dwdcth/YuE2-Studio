@@ -27,6 +27,9 @@ tauri-plugin-window-state = "2"
 music-engine = { path = "../../crates/music-engine" }
 music-server = { path = "../../crates/music-server" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# decoding the paths a browser asks the headless service for, as the window's
+# own asset resolver does
+percent-encoding = "2"
 
 # The desktop shell is deliberately isolated from the engine workspace. Its
 # release cadence and Tauri dependency graph must not modify native engines.

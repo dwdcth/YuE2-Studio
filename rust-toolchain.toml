@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable-x86_64-pc-windows-msvc"
+# The host's own stable: the studio is developed on Windows but built and run
+# on Linux too (headless service, engine), where a Windows host triple cannot
+# resolve. Windows keeps getting its msvc host, as rustup's default for it.
+channel = "stable"
 components = ["rustfmt", "clippy"]

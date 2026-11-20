@@ -753,7 +753,13 @@ struct PersistedStudioSettings {
     engine_options: EngineOptions,
     #[serde(default)]
     assistant: AssistantConfig,
+    // A settings file written by hand to turn one switch on - access from the
+    // network, on a studio run without a window - is still read as a whole:
+    // these two used to make the whole file fail serde and fall back to the
+    // defaults, silently ignoring what was written.
+    #[serde(default)]
     lyrics_sync: lyrics_sync::LyricsSyncConfig,
+    #[serde(default)]
     configuration: StudioConfiguration,
     selected_profile_id: Option<String>,
     #[serde(default)]
@@ -951,17 +957,42 @@ impl EngineOptions {
     /// with. Each song reserves a KV set, so nothing is reserved unasked.
     /// The CUDA build the engine will compute on, and so the cuBLAS it needs:
     /// chosen outright, or left to ggml on an NVIDIA card one of the builds
-    /// runs on. None on Vulkan and the processor.
+    /// runs on. None on Vulkan and the processor. Off Windows nothing promises
+    /// the CUDA backend beside the engine - the Linux package carries Vulkan -
+    /// so there it also takes the backend being there: in its build folder
+    /// from the build script, or beside the executable of a developer build.
+    /// Without it the card runs the backend the package does carry.
     fn cuda_build(&self) -> Option<hardware::CudaBuild> {
         use music_engine::yue_server::ComputeBackend;
         match self.backend {
-            ComputeBackend::Cuda | ComputeBackend::Auto => hardware::hardware().cuda,
+            ComputeBackend::Cuda | ComputeBackend::Auto => {
+                let build = hardware::hardware().cuda?;
+                #[cfg(not(windows))]
+                {
+                    let backend_file = music_engine::yue_server::YueServerLaunchConfig::cuda_backend_file();
+                    let carries_cuda = |directory: &std::path::Path| directory.join(build.folder()).join(backend_file).is_file() || directory.join(backend_file).is_file();
+                    // the same executable the launch resolves, by hand here:
+                    // engine_location() builds the launch options, whose
+                    // cuda_build() is this function - around it goes
+                    let engine_directory = env::var_os("YUE_ENGINE_BIN")
+                        .map(PathBuf::from)
+                        .or_else(|| self.engine_bin.as_ref().map(|path| path.trim()).filter(|path| !path.is_empty()).map(PathBuf::from))
+                        .and_then(|executable| executable.parent().map(|parent| parent.to_path_buf()))
+                        .unwrap_or_else(engine_bundle_root);
+                    if !carries_cuda(&engine_directory) {
+                        return None;
+                    }
+                }
+                Some(build)
+            }
             ComputeBackend::Vulkan | ComputeBackend::Cpu => None,
         }
     }
 
     /// Whether the engine will compute on Vulkan: chosen outright, or left to
-    /// ggml on a machine whose card is not NVIDIA.
+    /// ggml on a machine whose card is not NVIDIA - or whose NVIDIA card the
+    /// engine package has no CUDA backend for, which on Linux is the Vulkan
+    /// package on an NVIDIA card.
     fn uses_vulkan(&self) -> bool {
         use music_engine::yue_server::ComputeBackend;
         match self.backend {
@@ -973,7 +1004,7 @@ impl EngineOptions {
                     return false;
                 }
                 let hardware = hardware::hardware();
-                hardware.cuda.is_none() && hardware.gpu_name.is_some()
+                (hardware.cuda.is_none() || self.cuda_build().is_none()) && hardware.gpu_name.is_some()
             }
             ComputeBackend::Cuda | ComputeBackend::Cpu => false,
         }
@@ -985,33 +1016,50 @@ impl EngineOptions {
 
     /// The devices a start tries, in order. A device chosen in Settings is
     /// the only one, whatever happens to it. Auto goes CUDA, Vulkan, the
-    /// processor: CUDA when one of its builds runs this card and driver,
-    /// Vulkan when there is a card, and the processor always, last.
+    /// processor: CUDA when one of its builds runs this card and driver - and
+    /// the engine package carries the backend for it - Vulkan when there is a
+    /// card, and the processor always, last.
     fn device_chain(&self, failed: &[music_engine::yue_server::ComputeBackend]) -> Vec<music_engine::yue_server::ComputeBackend> {
         use music_engine::yue_server::ComputeBackend;
         if self.backend != ComputeBackend::Auto {
             return vec![self.backend];
         }
-        // Off Windows the engine is a single native build whose ggml loads its
-        // own best device - Metal on Apple Silicon - so Auto asks the engine
-        // to choose (no --device is passed) and only falls back to the
-        // processor if that start fails.
+        // Off Windows the engine is usually a single native build whose ggml
+        // loads its own best device - Metal on Apple Silicon, Vulkan from the
+        // Linux package - so Auto asks the engine to choose (no --device is
+        // passed) and only falls back to the processor if that start fails.
+        // A build with a CUDA backend beside it (the `cuda13` folder of a CUDA
+        // build, or the backend of a developer build) is started on CUDA
+        // outright instead and falls back like on Windows: a start named for
+        // its device beats hoping the engine picks the same one.
         #[cfg(not(windows))]
-        {
+        if self.cuda_build().is_none() {
             let mut chain = vec![ComputeBackend::Auto];
             chain.retain(|device| !failed.contains(device));
             chain.push(ComputeBackend::Cpu);
             return chain;
         }
-        #[cfg(windows)]
         {
             let hardware = hardware::hardware();
             let mut chain = Vec::new();
             if hardware.cuda.is_some() {
                 chain.push(ComputeBackend::Cuda);
             }
-            // an NVIDIA card that runs CUDA is never tried on Vulkan
-            if hardware.gpu_name.is_some() && (!hardware.nvidia || hardware.cuda.is_none()) {
+            // Vulkan only when the package carries it; an NVIDIA card that
+            // runs CUDA is never tried on Vulkan
+            #[cfg(not(windows))]
+            let has_vulkan_backend = {
+                let backend_file = if cfg!(target_os = "macos") { "libggml-vulkan.dylib" } else { "libggml-vulkan.so" };
+                let engine_directory = env::var_os("YUE_ENGINE_BIN")
+                    .map(PathBuf::from)
+                    .or_else(|| self.engine_bin.as_ref().map(|path| path.trim()).filter(|path| !path.is_empty()).map(PathBuf::from))
+                    .and_then(|executable| executable.parent().map(|parent| parent.to_path_buf()))
+                    .unwrap_or_else(engine_bundle_root);
+                engine_directory.join(backend_file).is_file()
+            };
+            #[cfg(windows)]
+            let has_vulkan_backend = true;
+            if has_vulkan_backend && hardware.gpu_name.is_some() && (!hardware.nvidia || hardware.cuda.is_none()) {
                 chain.push(ComputeBackend::Vulkan);
             }
             chain.retain(|device| !failed.contains(device));
@@ -1413,7 +1461,11 @@ pub async fn serve() -> anyhow::Result<()> {
         eprintln!("[ERROR] the saved proxy cannot be used, requests go straight out until it is fixed in Settings: {error:#}");
     }
     net::set(proxy);
-    let (bind_to, network_keyed) = remote::start(persisted.as_ref().and_then(|settings| settings.network.clone()));
+    // the desktop shell runs the service with `--headless`, and a standalone
+    // service can be started the same way: either turns access from the
+    // network on for the run, whatever the settings file says
+    let forced = std::env::var("YUE_STUDIO_HEADLESS").ok().is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let (bind_to, network_keyed) = remote::start(persisted.as_ref().and_then(|settings| settings.network.clone()), forced);
     let model_manager = ModelManager::from_environment()?;
     let community_downloads = Arc::new(downloads::Downloader::new(model_manager.models_directory().join("own")));
     let persisted_components = persisted
@@ -1934,8 +1986,14 @@ pub async fn serve() -> anyhow::Result<()> {
     let address = SocketAddr::from((bind_to, listen_port()));
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!("music-server listening on http://{address}");
+    // with the port answering, the addresses and the key belong where the
+    // person who started the studio can see them
+    if remote::headless() || network_keyed {
+        remote::print_access();
+    }
+    let state = state.clone();
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(shutdown(state))
         .await?;
     Ok(())
 }
@@ -5473,8 +5531,66 @@ async fn test_proxy(Json(settings): Json<net::ProxySettings>) -> Result<Json<Val
     net::test(settings).await.map(Json).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("{error:#}")))
 }
 
-async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+/// Ends the service: Ctrl-C from a console, and on unix the terminate signal
+/// a service manager or `kill` sends. Before the listener stops accepting -
+/// it still answers while this runs - the same closing work the window's quit
+/// does, so nothing is lost or left running.
+async fn shutdown(state: AppState) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = stream.recv() => {}
+                }
+            }
+            // no terminate signal could be installed: Ctrl-C alone decides
+            Err(_) => { let _ = tokio::signal::ctrl_c().await; }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    close_the_studio(&state).await;
+}
+
+/// The closing work of a studio without a window's quit: the songs being made
+/// are stopped and kept stopped - so the next start does not make them again -
+/// the day's statistics leave, and the engine is shut down with the card and
+/// the port it holds released. The window's shell does the same over its own
+/// routes; this is the path of a standalone or headless service.
+async fn close_the_studio(state: &AppState) {
+    let running: Vec<String> = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| matches!(job.status, MusicJobStatus::Queued | MusicJobStatus::Running))
+        .map(|job| job.id.clone())
+        .collect();
+    for id in &running {
+        match cancel_job(state, id).await {
+            Ok(_) => println!("[shutdown] stopped the song being made: {id}"),
+            Err((status, message)) => eprintln!("[shutdown] the song {id} could not be stopped ({status}): {}", message.error),
+        }
+    }
+    // the statistics of the session, through the hub's own route; the listener
+    // still answers, and a bare client keeps the loopback call off any proxy
+    if let Ok(client) = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).build() {
+        let flush = format!("http://127.0.0.1:{}/v1/hub/flush", listen_port());
+        if let Err(error) = client.post(&flush).send().await {
+            eprintln!("[shutdown] the day's statistics were not sent: {error}");
+        }
+    }
+    let mut supervisor = state.engine.lock().await;
+    if let Some(engine) = supervisor.as_mut() {
+        if let Err(error) = tokio::task::block_in_place(|| engine.stop(std::time::Duration::from_secs(10))) {
+            eprintln!("[shutdown] stopping the engine failed: {error}");
+        }
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -5745,8 +5861,36 @@ async fn restart_local_engine(State(state): State<AppState>) -> Result<Json<Valu
 /// Opens the native file picker for an engine executable. The window is a
 /// browser and cannot open one itself, so the studio picks on its behalf and
 /// hands the path back; nothing changes until the user saves the options, the
-/// same as every other field on that page.
-async fn pick_engine_executable() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+/// same as every other field on that page. A request body with a `path` names
+/// the file itself, for an agent or a curl against a studio without a display;
+/// and a studio that has no display to open a picker on says so, instead of
+/// answering that nothing was picked.
+async fn pick_engine_executable(body: axum::body::Bytes) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    // the window sends an empty body: that is a plain "open the picker"
+    #[derive(serde::Deserialize, Default)]
+    struct PickEngine {
+        #[serde(default)]
+        path: Option<String>,
+    }
+    let asked: PickEngine = if body.is_empty() {
+        PickEngine::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|error| api_error(StatusCode::BAD_REQUEST, format!("the request is not understood: {error}")))?
+    };
+    if let Some(path) = asked.path {
+        let picked = validated_engine_bin(Some(path)).map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+        return Ok(Json(serde_json::json!({
+            "picked": picked.is_some(),
+            "path": picked,
+        })));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this studio runs without a display: no file picker can open. Send {\"path\": \"/the/engine/yue-server\"} instead".into(),
+        ));
+    }
     let picked = tokio::task::spawn_blocking(|| {
         let mut dialog = rfd::FileDialog::new().set_title("The engine executable to run instead of the bundled one".to_string());
         // An extension filter would hide a Linux build, which has none.
@@ -5892,6 +6036,13 @@ async fn start_engine_again(state: &AppState) -> Result<(), String> {
         if cards.is_none() {
             note_once("nvidia-smi did not answer, so the graphics card chosen in Settings - Local engine is not checked; the engine starts as before");
         }
+    }
+    // Off Windows the engine package may simply not carry a CUDA backend - the
+    // Linux package is Vulkan - and CUDA chosen outright on it would be a
+    // start that can only fail; saying why beats an engine log that does not.
+    #[cfg(not(windows))]
+    if options.backend == music_engine::yue_server::ComputeBackend::Cuda && options.cuda_build().is_none() {
+        return Err("CUDA was chosen, but this engine has no CUDA backend beside it: on Linux, build the engine with scripts/build-yue-runtime-linux.sh on a machine with nvcc (a cuda13 folder appears beside yue-server) and point the studio at it with YUE_ENGINE_ROOT, or choose Vulkan in Settings.".into());
     }
     let chain = options.device_chain(&state.failed_devices.read().await);
     {
@@ -6909,7 +7060,9 @@ async fn persist_studio_settings(state: &AppState) -> anyhow::Result<()> {
         file_tags_settings: Some(*state.file_tags_settings.read().await),
         cover_look: Some(state.cover_look.read().await.clone()),
         proxy: Some(net::current()),
-        network: Some(remote::current()),
+        // what the user chose: a headless run forces access on in memory only,
+        // and the file keeps its own switch, so it writes nothing of the run
+        network: Some(remote::persisted()),
     };
     if let Some(parent) = state.settings_path.parent() { fs::create_dir_all(parent)?; }
     let temporary = state.settings_path.with_extension("json.part");
@@ -9502,6 +9655,12 @@ async fn open_data_directory() -> Result<Json<Value>, (StatusCode, Json<ApiError
         return Err(api_error(StatusCode::NOT_FOUND, "the studio has no data directory".into()));
     };
     let _ = std::fs::create_dir_all(&root);
+    // a studio run without a display cannot show a file manager to anyone:
+    // the path itself is the answer then, which the page can still show
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Ok(Json(serde_json::json!({ "opened": false, "path": root.display().to_string() })));
+    }
     #[cfg(windows)]
     let opened = music_engine::process_group::detach_from_group(&mut std::process::Command::new("explorer.exe")).arg(&root).spawn();
     #[cfg(target_os = "macos")]
@@ -9509,7 +9668,7 @@ async fn open_data_directory() -> Result<Json<Value>, (StatusCode, Json<ApiError
     #[cfg(all(not(windows), not(target_os = "macos")))]
     let opened = music_engine::process_group::detach_from_group(&mut dub_core::proc::host_command("xdg-open")).arg(&root).spawn();
     opened.map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({ "opened": root.display().to_string() })))
+    Ok(Json(serde_json::json!({ "opened": true, "path": root.display().to_string() })))
 }
 
 async fn setup_catalog(State(state): State<AppState>) -> Json<Value> {
@@ -11527,11 +11686,19 @@ async fn cancel_music_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<MusicJob>, (StatusCode, Json<ApiError>)> {
+    cancel_job(&state, &job_id).await.map(Json)
+}
+
+/// Stops one song: the engine is told at its next checkpoint, the job is
+/// marked cancelled and that is kept at once, so a studio closed right after
+/// does not make the song again. The route the window and the agents call and
+/// the service's own shutdown share this.
+async fn cancel_job(state: &AppState, job_id: &str) -> Result<MusicJob, (StatusCode, Json<ApiError>)> {
     let existing = state
         .jobs
         .read()
         .await
-        .get(&job_id)
+        .get(job_id)
         .cloned()
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Music job was not found.".into()))?;
     if existing.engine_id != PRIMARY_MUSIC_ENGINE_ID {
@@ -11542,31 +11709,31 @@ async fn cancel_music_job(
     }
     if matches!(existing.phase, MusicJobPhase::ExtractingVocals) {
         let mut jobs = state.jobs.write().await;
-        let job = jobs.get_mut(&job_id).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Music job was not found.".into()))?;
+        let job = jobs.get_mut(job_id).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Music job was not found.".into()))?;
         job.status = MusicJobStatus::Cancelled;
         job.phase = MusicJobPhase::Cancelled;
         job.message = "Vocals extraction cancelled.".into();
         // kept at once, as an engine stop is
-        if let Err(error) = state.library.set_music_job_status(&job_id, job_status_name(&job.status), &job.message) {
+        if let Err(error) = state.library.set_music_job_status(job_id, job_status_name(&job.status), &job.message) {
             eprintln!("[ERROR] the stopped song's state could not be kept: {error:#}");
         }
-        return Ok(Json(job.clone()));
+        return Ok(job.clone());
     }
-    let remote = state.music_server.cancel(&job_id).await.map_err(|error| {
+    let remote = state.music_server.cancel(job_id).await.map_err(|error| {
         api_error(StatusCode::SERVICE_UNAVAILABLE, format!("the engine did not accept the cancel: {error}"))
     })?;
-    let failure = (remote.status == "failed").then(|| engine_failure_reason(&job_id)).flatten();
+    let failure = (remote.status == "failed").then(|| engine_failure_reason(job_id)).flatten();
     let mut jobs = state.jobs.write().await;
     let job = jobs
-        .get_mut(&job_id)
+        .get_mut(job_id)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Music job was not found.".into()))?;
     apply_remote_status(job, &remote.status, failure);
     stop_on_request(job);
     // kept at once: a studio closed right after the stop must not start the song again
-    if let Err(error) = state.library.set_music_job_status(&job_id, job_status_name(&job.status), &job.message) {
+    if let Err(error) = state.library.set_music_job_status(job_id, job_status_name(&job.status), &job.message) {
         eprintln!("[ERROR] the stopped song's state could not be kept: {error:#}");
     }
-    Ok(Json(job.clone()))
+    Ok(job.clone())
 }
 
 /// The engine ends a cancelled job at its next checkpoint, and a job that has
@@ -13473,6 +13640,21 @@ mod tests {
         assert_eq!(cover_source(&library, "gone", false).unwrap_err().0, StatusCode::BAD_REQUEST);
         drop(library);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_settings_file_written_by_hand_to_turn_one_switch_on_is_read() {
+        // The smallest file a person writes to reach a headless studio from
+        // the network: nothing but the switch. It used to fail serde as a
+        // whole and fall back to every default, silently ignoring it.
+        let restored: PersistedStudioSettings = serde_json::from_str(r#"{"network": {"enabled": true}}"#).expect("a minimal file parses");
+        assert!(restored.network.as_ref().is_some_and(|access| access.enabled));
+        assert!(!restored.lyrics_sync.enabled, "karaoke is off unless the file says otherwise");
+        assert_eq!(
+            serde_json::to_value(&restored.configuration).unwrap(),
+            serde_json::to_value(initial_configuration()).unwrap(),
+            "the configuration is what a first start gets"
+        );
     }
 
     #[test]

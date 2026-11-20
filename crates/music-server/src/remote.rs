@@ -41,22 +41,62 @@ fn listening() -> &'static OnceLock<bool> {
     &LISTENING
 }
 
+/// A headless run forces access on for itself. The file's own switch is kept
+/// apart, so nothing it turns on leaks into the settings the windowed studio
+/// reads; only a key made for the run is kept.
+fn forced() -> &'static OnceLock<bool> {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    &FORCED
+}
+
+/// What the file said about access when this run started; the headless
+/// override does not change it. An explicit change from the settings page
+/// updates it, so what the user chose by hand still reaches the file.
+fn file_enabled() -> &'static OnceLock<bool> {
+    static FILE_ENABLED: OnceLock<bool> = OnceLock::new();
+    &FILE_ENABLED
+}
+
 pub fn current() -> NetworkAccess {
     setting().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+/// Whether this run was started headless, with access from the network forced on.
+pub fn headless() -> bool {
+    forced().get().copied().unwrap_or(false)
+}
+
+/// The setting as it goes into the settings file: what the user chose, the
+/// headless override left out, so the windowed studio still binds loopback
+/// after a headless run of the same installation.
+pub fn persisted() -> NetworkAccess {
+    let mut access = current();
+    if headless() {
+        access.enabled = file_enabled().get().copied().unwrap_or(false);
+    }
+    access
 }
 
 /// Loads the kept setting at the service's start and says which address to
 /// bind: every address when it is on, loopback otherwise. A setting turned on
 /// in the file by hand has no key yet and gets one here; the second value says
 /// the setting changed and is to be saved.
-pub fn start(saved: Option<NetworkAccess>) -> ([u8; 4], bool) {
-    let mut saved = saved.unwrap_or_default();
-    let keyed = saved.enabled && saved.key.is_empty();
-    if keyed {
-        saved.key = new_key();
-    }
-    let open = saved.enabled;
-    *setting().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = saved;
+///
+/// `forced` is a headless run, started to be reached from other computers
+/// whatever the file says: the in-memory setting turns on with it - the guard
+/// reads that - while the file keeps the user's own switch, so only a key
+/// made for the run is written back.
+pub fn start(saved: Option<NetworkAccess>, forced_on: bool) -> ([u8; 4], bool) {
+    let saved = saved.unwrap_or_default();
+    let keyed = (saved.enabled || forced_on) && saved.key.is_empty();
+    let access = NetworkAccess {
+        enabled: saved.enabled || forced_on,
+        key: if keyed { new_key() } else { saved.key },
+    };
+    let open = access.enabled;
+    *setting().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = access;
+    let _ = file_enabled().set(saved.enabled);
+    let _ = forced().set(forced_on);
     let _ = listening().set(open);
     (if open { [0, 0, 0, 0] } else { [127, 0, 0, 1] }, keyed)
 }
@@ -67,7 +107,7 @@ fn new_key() -> String {
 }
 
 /// The addresses of this computer another one on the network reaches it at.
-fn local_addresses() -> Vec<String> {
+pub(crate) fn local_addresses() -> Vec<String> {
     // the address the system would send from, without sending anything
     let mut found = Vec::new();
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -80,6 +120,21 @@ fn local_addresses() -> Vec<String> {
         }
     }
     found
+}
+
+/// Says where the studio can be reached from, for a start whose access from
+/// the network is on: this computer's loopback, the addresses another one on
+/// the network reaches it at, and how an agent connects. Printed once, after
+/// the port answers, so the person starting a headless studio has the address
+/// with its key in the console the service runs in.
+pub fn print_access() {
+    let access = current();
+    let port = crate::listen_port();
+    println!("access from the network is on; the studio answers at:");
+    for address in std::iter::once("127.0.0.1").chain(local_addresses().iter().map(String::as_str)) {
+        println!("  http://{address}:{port}/?key={}", access.key);
+    }
+    println!("an agent connects to http://<that address>:{port}/mcp with the header \"Authorization: Bearer {}\"", access.key);
 }
 
 /// Whether a request comes from this computer itself. A tunnel or reverse
@@ -163,6 +218,9 @@ pub async fn change(
         let mut access = setting().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(enabled) = change.enabled {
             access.enabled = enabled;
+            // an explicit choice reaches the file even in a headless run,
+            // whose own override would otherwise keep the file's switch back
+            let _ = file_enabled().set(enabled);
         }
         if change.new_key || (access.enabled && access.key.is_empty()) {
             access.key = new_key();
@@ -316,5 +374,22 @@ mod tests {
         assert!(same("abc", "abc"));
         assert!(!same("abc", "abd"));
         assert!(!same("abc", "ab"));
+    }
+
+    #[test]
+    fn a_headless_start_forces_the_network_on_without_changing_the_file() {
+        let (bind, keyed) = start(Some(NetworkAccess::default()), true);
+        assert_eq!(bind, [0, 0, 0, 0]);
+        assert!(keyed, "a key is made for the run");
+        assert!(headless());
+        assert!(current().enabled, "the guard reads the in-memory switch");
+        // what the file keeps: the user's own switch, off, and the key made for the run
+        let kept = persisted();
+        assert!(!kept.enabled);
+        assert!(!kept.key.is_empty());
+        // the next normal start binds loopback and keeps the key
+        let (bind, keyed) = start(Some(kept), false);
+        assert_eq!(bind, [127, 0, 0, 1]);
+        assert!(!keyed);
     }
 }

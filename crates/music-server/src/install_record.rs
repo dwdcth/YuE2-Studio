@@ -136,6 +136,11 @@ pub fn write(record: &Path, url: &str, sha256: &str, files: &[PathBuf], root: &P
         .collect::<Result<Vec<_>>>()?;
     let body = serde_json::to_vec_pretty(&InstallRecord { sha256: sha256.to_string(), url: url.to_string(), files })?;
     let partial = record.with_extension("json.tmp");
+    // a record can name a folder its install never made: a picked library in a
+    // sub-directory of its own, on a machine that never had the folder before
+    if let Some(parent) = partial.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
+    }
     fs::write(&partial, body).with_context(|| format!("write {}", partial.display()))?;
     fs::rename(&partial, record).with_context(|| format!("write {}", record.display()))?;
     remove_if_there(&installing_mark(record))
