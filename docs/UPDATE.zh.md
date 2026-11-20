@@ -3,6 +3,17 @@
 > 本仓库是 [timoncool/YuE2-Studio](https://github.com/timoncool/YuE2-Studio) 的 fork，
 > `linux-headless` 分支携带我们的改动：无头模式（`--headless`）+ Linux CUDA 引擎。
 
+## 本 fork 的固定原则（2026-11-20 定型，以后更新不变）
+
+1. **只做 server 模式**：Rust 后台服务（standalone `music-server`，无头网络强制
+   `YUE_STUDIO_HEADLESS=1`）+ vite 出 UI（`0.0.0.0:3791`，代理已改写 Origin 过
+   服务端守卫）。**desktop 壳（desktop/src-tauri）保持上游原状，永不构建、
+   永不修改**——上游更新时该目录直接跟上游，rebase 冲突一律取上游侧。
+2. **Linux 引擎只编译本机的显卡**：`build-yue-runtime-linux.sh` 默认用
+   `nvidia-smi` 探测本机卡只编那一代架构（约 8 分钟，产物 ~68MB）；更新时
+   **不要**改回六代全量。只有产物要拷去别的机器时才
+   `YUE_CUDA_ARCHITECTURES=universal`（约 25 分钟，136MB）。
+
 ## 分支布局
 
 | 分支 | 角色 | 规矩 |
@@ -60,9 +71,8 @@ YUE_STUDIO_HEADLESS=1 YUE_ENGINE_ROOT=$HOME/yue2-engine \
 cd app && npm run dev &
 ```
 
-desktop 壳（浏览器 UI 的 `--headless` 二进制）只在界面代码变了时才值得重建：
-`cd desktop/src-tauri && cargo build --release`（注意它用独立的
-`CARGO_TARGET_DIR=$HOME/.cargo-target/yue2-desktop`）。
+desktop 壳不构建（见固定原则 1）；UI 就是 vite dev 服务器，
+上游更新前端后 `npm --prefix app install` 即可（脚本已内置）。
 
 ## 冲突高发区与判定锚点
 
@@ -96,7 +106,7 @@ FP16 clamp、文件名字面量）上的环境敏感 bug 顺手修正。
 |---|---|
 | Rust 代码 | `cargo build --release -p music-server`（+ 跑测试）|
 | `engines/yue2-cpp-source.json` 的 commit | 重建引擎（脚本自动检测 pin 变化）|
-| 前端 `app/` | `npm --prefix app run build` + 重建 desktop 壳（UI 内嵌在二进制里）|
+| 前端 `app/` | `npm --prefix app install`（vite 吃源码，无需构建）|
 | 模型 pin（`model_manager.rs` 的 sha/版本）| 无需手动：工作室自己检测并按 setup 流程下载 |
 | `rust-toolchain.toml` / 上游要求的 Rust 版本 | 按用户自己装的 rustup 工具链对齐 |
 
@@ -111,7 +121,8 @@ rebase 出问题：`git rebase --abort` 回到更新前；已提交但想放弃�
 you polished them and sent the fixes back as a pull request"）。我们的改动
 全部用上游的英文注释风格写成，天然适合拆成 PR：
 
-1. 无头模式（服务 + desktop 壳 + 文档）——通用功能，Windows 也受益；
+1. 服务侧的无头网络强制 + SIGTERM 优雅停机 + 小修（settings serde 默认值、
+   install_record 建目录、pick-executable 传路径）——desktop 壳按原则 1 不提；
 2. Linux CUDA 引擎链路（hardware/engine_runtime/构建脚本）；
 3. 小修：settings serde 默认值、install_record 建目录、pick-executable 传路径。
 

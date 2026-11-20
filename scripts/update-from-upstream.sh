@@ -27,10 +27,12 @@ git rebase origin/main
 echo "== 2/5 测试"
 cargo test --workspace
 
-echo "== 3/5 重建服务二进制"
+echo "== 3/5 重建服务二进制与前端依赖"
 cargo build --release -p music-server
 service="$CARGO_TARGET_DIR/release/music-server"
 [ -x "$service" ] && echo "    → $service"
+# vite 直接跑源码，不需要构建；但上游更新可能换了前端依赖
+npm --prefix app install --no-audit --no-fund --silent && echo "    → app 依赖已同步"
 
 if [ "$old_pin" != "$(engine_pin)" ]; then
     echo "== 4/5 引擎 pin 变了（$old_pin → $(engine_pin)），重建引擎（脚本自动检测 nvcc 加 CUDA 后端）"
@@ -39,6 +41,7 @@ else
     echo "== 4/5 引擎 pin 未变（$(engine_pin)），跳过重建"
 fi
 
-echo "== 5/5 完成。提醒："
-echo "    - 前端变了才需要重建 desktop 壳（浏览器 UI）: cd desktop/src-tauri && CARGO_TARGET_DIR=\$HOME/.cargo-target/yue2-desktop cargo build --release"
-echo "    - 重启你的无头服务（yue2-studio-desktop --headless 或 music-server + YUE_STUDIO_HEADLESS=1）"
+echo "== 5/5 完成。重启两个进程（本 fork 只做 server 模式，不构建 desktop 壳）："
+echo "    YUE_STUDIO_HEADLESS=1 YUE_ENGINE_ROOT=\$HOME/yue2-engine \\"
+echo "      $service &"
+echo "    cd app && npm run dev &      # UI: http://<机器IP>:3791"
