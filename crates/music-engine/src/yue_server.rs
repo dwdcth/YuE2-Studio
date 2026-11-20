@@ -932,11 +932,13 @@ mod tests {
         assert_eq!(config(None).cuda_backend().unwrap(), None);
         // A release without the folder is broken, never quietly off CUDA.
         assert!(config(Some("cuda12")).cuda_backend().is_err());
+        // the backend's file, as the loader names it on this platform
+        let backend_file = if cfg!(windows) { "ggml-cuda.dll" } else { "libggml-cuda.so" };
         fs::create_dir_all(root.join("cuda12")).unwrap();
-        fs::write(root.join("cuda12").join("ggml-cuda.dll"), b"x").unwrap();
-        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join("ggml-cuda.dll")));
+        fs::write(root.join("cuda12").join(backend_file), b"x").unwrap();
+        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join(backend_file)));
         // A developer build: the one backend beside the executable.
-        fs::write(root.join("ggml-cuda.dll"), b"x").unwrap();
+        fs::write(root.join(backend_file), b"x").unwrap();
         assert_eq!(config(Some("cuda13")).cuda_backend().unwrap(), None);
         fs::remove_dir_all(&root).ok();
     }

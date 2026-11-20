@@ -43,7 +43,7 @@ cargo test --workspace
 # 4. 重建（引擎 pin 变了才重建引擎）
 cargo build --release -p music-server
 old_pin 变了 → PATH=/usr/local/cuda/bin:$PATH \
-  scripts/build-yue-runtime-linux.sh ~/yue2-engine -RuntimeBackend cuda
+  scripts/build-yue-runtime-linux.sh ~/yue2-engine   # 脚本自动检测 nvcc 加 CUDA 后端
 
 # 5. 重启服务（用 systemd 或手工）
 ```
@@ -54,16 +54,26 @@ desktop 壳（浏览器 UI 的 `--headless` 二进制）只在界面代码变了
 
 ## 冲突高发区与判定锚点
 
+**2026-11-20 实战记录**（a35616e → 8df2deb，跨 v3.8.4–v4.1.0）：上游 v4.x
+自己实现了 Linux CUDA 引擎链路（构建脚本自动检测 nvcc、PyPI wheel 版
+cuBLAS、cuda12 支持）和 `--headless`（托盘语义，面向有桌面的机器）——
+我们与上游重叠的改动全部**改为跟随上游**，只保留 music-server 侧的独有
+贡献：`YUE_STUDIO_HEADLESS=1` 无头网络强制、SIGTERM 优雅停机、settings
+手写文件修复、pick-executable 传路径、`cuda_build()` 的 Auto 目录门
+（显式 CUDA 不受门限制，缺后端由 restart_engine 明确报错）。
+冲突解法：**上游已实现等价功能的一律取上游**，我们的残留引用（如已被
+上游删除的函数）改写为上游风格；上游测试在特定硬件（Turing 卡的
+FP16 clamp、文件名字面量）上的环境敏感 bug 顺手修正。
+
 上游改动如果碰到这些函数/区域就会冲突，每个改动在代码里都留了注释锚点（搜
 `headless`、`Linux`、`cuda13`）：
 
 | 文件 | 我们的改动 | 上游常见动因 |
 |---|---|---|
-| `crates/music-server/src/lib.rs` | `serve()` 的 forced env、`shutdown()/close_the_studio()`、`cancel_job()`、`cuda_build()/device_chain()/uses_vulkan()` | 新功能加路由（不冲突）、引擎选项重构（冲突）|
+| `crates/music-server/src/lib.rs` | `serve()` 的 forced env、`shutdown()/close_the_studio()`、`cancel_job()`、`cuda_build()` 的 Auto 目录门 | 新功能加路由（不冲突）、引擎选项重构（冲突）|
 | `crates/music-server/src/remote.rs` | `start(saved, forced)`、`persisted()`、`print_access()` | 网络访问功能演进 |
-| `crates/music-server/src/hardware.rs` | `cuda_build()` Linux 只放行 Cuda13 | 新卡型/驱动阈值调整 |
-| `crates/music-server/src/engine_runtime.rs` | 平台化 cuBLAS 资产、`loader_finds()` | 上游换 cuBLAS 版本（记得两平台同步）|
-| `desktop/src-tauri/src/lib.rs` | `run()` 头部 headless 分支、`run_headless()`、`embedded_asset_source()` | 壳功能演进（冲突率低）|
+| `crates/music-server/src/install_record.rs` | `write()` 补建父目录 | 下载记录机制演进 |
+| 测试模块 | settings 最小文件测试 | 同位置插入新测试（两边都保）|
 
 冲突解法原则：**保上游的新逻辑，把我们的"headless/平台分支"语义贴上去**——
 我们的改动几乎都是"在既有决策点上加一个 Linux/headless 条件"，很少整体改写。

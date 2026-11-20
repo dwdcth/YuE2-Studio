@@ -965,11 +965,16 @@ impl EngineOptions {
     fn cuda_build(&self) -> Option<hardware::CudaBuild> {
         use music_engine::yue_server::ComputeBackend;
         match self.backend {
-            ComputeBackend::Cuda | ComputeBackend::Auto => {
+            // chosen outright: what the card and its driver run; an engine
+            // without the backend beside it is told so at its start
+            ComputeBackend::Cuda => hardware::hardware().cuda,
+            ComputeBackend::Auto => {
                 let build = hardware::hardware().cuda?;
                 #[cfg(not(windows))]
                 {
-                    let backend_file = music_engine::yue_server::YueServerLaunchConfig::cuda_backend_file();
+                    // the backend's file, as the engine loads it - upstream names
+                    // it inline in cuda_backend(), which has no helper to call
+                    let backend_file = if cfg!(windows) { "ggml-cuda.dll" } else { "libggml-cuda.so" };
                     let carries_cuda = |directory: &std::path::Path| directory.join(build.folder()).join(backend_file).is_file() || directory.join(backend_file).is_file();
                     // the same executable the launch resolves, by hand here:
                     // engine_location() builds the launch options, whose
@@ -13707,7 +13712,13 @@ mod tests {
         let vulkan = EngineOptions { backend: music_engine::yue_server::ComputeBackend::Vulkan, ..EngineOptions::default() }.to_engine(None);
         assert!(vulkan.clamp_fp16, "Vulkan runs clamp hidden states to FP16");
         let cuda = EngineOptions { backend: music_engine::yue_server::ComputeBackend::Cuda, ..EngineOptions::default() }.to_engine(None);
-        assert!(!cuda.clamp_fp16);
+        // Turing and older accumulate in FP16 and run the clamp; a newer card does not.
+        // The assertion was written on one and failed on the other.
+        if hardware::accumulates_in_fp16() {
+            assert!(cuda.clamp_fp16);
+        } else {
+            assert!(!cuda.clamp_fp16);
+        }
         // Every card starts on the model's full context; only the user's own value sets it smaller.
         assert_eq!(EngineOptions::capped_max_seq(None), None, "the full context unless set");
         assert_eq!(EngineOptions::capped_max_seq(Some(16384)), Some(16384), "the user's own value is passed as it is");

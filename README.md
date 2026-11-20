@@ -467,13 +467,16 @@ Start-Process "$env:LOCALAPPDATA\YuE2 Studio\YuE2-Studio.exe" -ArgumentList '--h
 [docs/mcp-skill.md](docs/mcp-skill.md) is the skill an agent reads: every tool, what the
 model expects, and step-by-step recipes.
 
-## Without a window (headless)
+## Without a window (a server on Linux)
 
-The same executable runs as a service only — no window, no desktop, nothing
-of the WebView — for a Linux server or a Windows GPU box behind a door:
+The studio's service runs on its own — no window, no desktop, nothing of the
+WebView — for a Linux server or a GPU box behind a door. In this fork that is
+the `music-server` binary with one variable; the upstream
+`YuE2-Studio --headless` is a different thing (a tray on a machine that has a
+desktop, for an agent to start and stop):
 
 ```bash
-YuE2-Studio --headless            # or YUE_STUDIO_HEADLESS=1
+YUE_STUDIO_HEADLESS=1 YUE_ENGINE_ROOT=/opt/yue2-engine music-server
 ```
 
 - It listens on **every address** and requires the **access key**: the
@@ -481,30 +484,26 @@ YuE2-Studio --headless            # or YUE_STUDIO_HEADLESS=1
   into the console it runs in. The key is kept in the settings, so it is the
   same at the next start; the network switch the windowed studio reads is
   **not** turned on by a headless run.
-- A browser on another computer opens `http://<address>:8791/?key=<key>` —
-  the same interface the window shows, save dialogs included (the browser
-  downloads instead).
 - An agent connects over MCP with the key as a bearer token:
   `claude mcp add --transport http yue2-studio "http://<address>:8791/mcp" --header "Authorization: Bearer <key>"`.
   Everything works without a window; the forty tools that drive the window
-  itself (screenshots, clicks, the player) answer that none is open —
-  **except over an SSH tunnel**: `ssh -L 8791:127.0.0.1:8791` and the page
-  at `http://localhost:8791` is the window, all forty tools included.
-- **Ctrl-C, and on Linux SIGTERM** (`systemctl stop`), end it cleanly: songs
-  being made are stopped and kept stopped, the day's statistics are sent, the
-  engine releases the card. Give a service manager half a minute for that
-  (`TimeoutStopSec=30`).
+  itself answer that none is open — **except over an SSH tunnel**:
+  `ssh -L 8791:127.0.0.1:8791` and a browser at `http://localhost:8791` is
+  the window, all forty tools included.
+- **Ctrl-C and SIGTERM** (`systemctl stop`) end it cleanly: songs being made
+  are stopped and kept stopped, the day's statistics are sent, the engine
+  releases the card. Give a service manager half a minute (`TimeoutStopSec=30`).
 
 ```ini
 # ~/.config/systemd/user/yue2-studio.service
 [Unit]
-Description=YuE2 Studio (headless)
+Description=YuE2 Studio (headless service)
 After=network-online.target
 
 [Service]
-ExecStart=/opt/YuE2-Studio/YuE2-Studio --headless
-# the engine built below, when it is not beside the executable
-#Environment=YUE_ENGINE_ROOT=/opt/yue2-engine
+ExecStart=/opt/yue2-studio/music-server
+Environment=YUE_STUDIO_HEADLESS=1
+Environment=YUE_ENGINE_ROOT=/opt/yue2-engine
 TimeoutStopSec=30
 Restart=on-failure
 
@@ -512,24 +511,22 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-On **Linux** the engine is built from source. With an NVIDIA card (Turing or
-newer, driver 580 or newer) the CUDA build runs the card; `all` carries
-Vulkan and the processor builds beside it:
+On **Linux** the engine is built from source. The build script adds the CUDA
+13 backend on its own when `nvcc` is on the machine (and the CUDA 12 backend
+too when a CUDA 12.9 toolkit is at `CUDA12_ROOT`), beside the Vulkan and
+processor builds:
 
 ```bash
-sudo apt install cuda-toolkit-13-x vulkan-sdk        # nvcc for CUDA, glslc for Vulkan
-scripts/build-yue-runtime-linux.sh /opt/yue2-engine -RuntimeBackend all
+sudo apt install libvulkan-dev spirv-headers glslc    # the Vulkan build
+sudo apt install cuda-nvcc-13-0 libcublas-dev-13-0    # the CUDA 13 backend
+scripts/build-yue-runtime-linux.sh /opt/yue2-engine
 ```
 
-A machine with the CUDA toolkit already has the cuBLAS the backend needs;
-without one the studio downloads NVIDIA's own redistributable (776 MB) beside
-the engine on the first start. Vulkan-only builds (the default
-`-RuntimeBackend vulkan`) work as before on any card, and the studio picks
-CUDA only when the engine beside it carries it.
+The cuBLAS a CUDA build needs is fetched into the studio's own folder on the
+first start (NVIDIA's Linux wheels, checked by the hash their publisher
+states). The studio starts on CUDA only when the engine beside it carries the
+backend, and the Vulkan-only build behaves as before on any card.
 
-A settings file written by hand — `~/.local/share/yue2-studio/studio-settings.json`
-— with nothing but `{"network": {"enabled": true}}` turns access from the
-network on for any start, windowed or headless, and is read as a whole.
 
 ## Models
 

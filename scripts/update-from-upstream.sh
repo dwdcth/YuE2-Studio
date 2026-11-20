@@ -33,8 +33,8 @@ service="$CARGO_TARGET_DIR/release/music-server"
 [ -x "$service" ] && echo "    → $service"
 
 if [ "$old_pin" != "$(engine_pin)" ]; then
-    echo "== 4/5 引擎 pin 变了（$old_pin → $(engine_pin)），重建 CUDA 引擎"
-    env PATH=/usr/local/cuda/bin:$PATH bash scripts/build-yue-runtime-linux.sh "$HOME/yue2-engine" -RuntimeBackend cuda
+    echo "== 4/5 引擎 pin 变了（$old_pin → $(engine_pin)），重建引擎（脚本自动检测 nvcc 加 CUDA 后端）"
+    env PATH=/usr/local/cuda/bin:$PATH bash scripts/build-yue-runtime-linux.sh "$HOME/yue2-engine"
 else
     echo "== 4/5 引擎 pin 未变（$(engine_pin)），跳过重建"
 fi
