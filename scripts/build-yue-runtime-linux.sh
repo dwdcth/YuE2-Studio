@@ -12,6 +12,19 @@ repository="$(sed -n 's/.*"repository": "\(.*\)".*/\1/p' "$root/engines/yue2-cpp
 commit="$(sed -n 's/.*"commit": "\(.*\)".*/\1/p' "$root/engines/yue2-cpp-source.json")"
 worktree="${YUE_ENGINE_BUILD_ROOT:-${TMPDIR:-/tmp}}/yue2-engine"
 
+# The CUDA 13 backend's architectures: this machine's own card by default (a
+# local build runs on the card it is built on, and one generation compiles in
+# a fraction of the time of six), the whole consumer range with
+# YUE_CUDA_ARCHITECTURES=universal, or any list of your own in that variable.
+cuda_architectures="${YUE_CUDA_ARCHITECTURES:-}"
+if [ -z "$cuda_architectures" ]; then
+    if compute="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1)" && [[ "$compute" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        cuda_architectures="${compute/./}-real"    # 7.5 → 75-real
+    fi
+fi
+cuda_architectures="${cuda_architectures:-universal}"
+[ "$cuda_architectures" = "universal" ] && cuda_architectures="75-real;80-real;86-real;89-real;90-real;120a-real"
+
 if [ ! -d "$worktree/.git" ]; then
     git clone "$repository" "$worktree"
 fi
@@ -43,7 +56,7 @@ if command -v nvcc >/dev/null 2>&1; then
     rm -rf "$worktree/build-linux-cuda13"
     cmake -S "$worktree" -B "$worktree/build-linux-cuda13" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_ALL_QUANTS=ON \
-        "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;120a-real" \
+        "-DCMAKE_CUDA_ARCHITECTURES=$cuda_architectures" \
         -DCMAKE_BUILD_RPATH='$ORIGIN:$ORIGIN/..' -DCMAKE_INSTALL_RPATH='$ORIGIN:$ORIGIN/..' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     cmake --build "$worktree/build-linux-cuda13" --config Release --target ggml-cuda -j "$(getconf _NPROCESSORS_ONLN)"
     cuda="$(find "$worktree/build-linux-cuda13" -name 'libggml-cuda.so' -type f | head -n 1)"
