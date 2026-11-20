@@ -13,25 +13,34 @@ export default defineConfig(({ mode }) => {
       port: 3791,
       host: '0.0.0.0',
       proxy: {
+        // The service's guard answers a page's origin: a browser on another
+        // computer reaches this dev server at the machine's own address, and
+        // its origin would be refused as another site's. The proxy speaks to
+        // the service as the loopback page it expects.
         '/v1': {
           target: 'http://127.0.0.1:8791',
           changeOrigin: true,
+          headers: { origin: 'http://127.0.0.1:3791' },
         },
         '/setup': {
           target: 'http://127.0.0.1:8791',
           changeOrigin: true,
+          headers: { origin: 'http://127.0.0.1:3791' },
         },
         '/engine': {
           target: 'http://127.0.0.1:8791',
           changeOrigin: true,
+          headers: { origin: 'http://127.0.0.1:3791' },
         },
         '/health': {
           target: 'http://127.0.0.1:8791',
           changeOrigin: true,
+          headers: { origin: 'http://127.0.0.1:3791' },
         },
         '/mcp': {
           target: 'http://127.0.0.1:8791',
           changeOrigin: true,
+          headers: { origin: 'http://127.0.0.1:3791' },
         },
         // There is deliberately no proxy for the retired ACE Node service:
         // the studio talks to the native Rust server only, so a stray legacy
