@@ -15,7 +15,8 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cargo-target/yue2-studio}"
 engine_pin() { sed -n 's/.*"commit": "\(.*\)".*/\1/p' engines/yue2-cpp-source.json; }
 
 [ "$(git branch --show-current)" = "linux-headless" ] || { echo "[ERROR] 请在 linux-headless 分支上运行" >&2; exit 1; }
-[ -z "$(git status --porcelain)" ] || { echo "[ERROR] 工作区不干净，先提交或暂存" >&2; exit 1; }
+# 只看已跟踪文件的改动：untracked 的构建产物（gen/schemas 等）不该挡住更新
+git diff --quiet && git diff --cached --quiet || { echo "[ERROR] 已跟踪文件有未提交改动，先提交或暂存" >&2; git status --short | head -5 >&2; exit 1; }
 
 old_pin="$(engine_pin)"
 echo "== 1/5 拉上游"
