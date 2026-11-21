@@ -115,15 +115,8 @@ FP16 clamp、文件名字面量）上的环境敏感 bug 顺手修正。
 rebase 出问题：`git rebase --abort` 回到更新前；已提交但想放弃：
 `git reset --hard backup/<日期tag>`。
 
-## 长期路线：把改动推回上游
+## 定位：纯本地 fork，不推上游
 
-上游 README 明确欢迎 Linux 修复（"If you live on Linux, it would be great if
-you polished them and sent the fixes back as a pull request"）。我们的改动
-全部用上游的英文注释风格写成，天然适合拆成 PR：
-
-1. 服务侧的无头网络强制 + SIGTERM 优雅停机 + 小修（settings serde 默认值、
-   install_record 建目录、pick-executable 传路径）——desktop 壳按原则 1 不提；
-2. Linux CUDA 引擎链路（hardware/engine_runtime/构建脚本）；
-3. 小修：settings serde 默认值、install_record 建目录、pick-executable 传路径。
-
-上游合并哪部分，我们就从本分支删掉对应提交，维护负担随之消失。
+这个分支只为自己机器维护（2026-11-21 定）：**不给上游提 PR**。改动保持
+英文注释风格只是为了 rebase 好读；上游将来自己实现了等价功能时按"冲突
+取上游"处理即可，两个方向的流动都到此为止。
