@@ -5915,7 +5915,12 @@ async fn pick_engine_executable(body: axum::body::Bytes) -> Result<Json<Value>, 
 
 /// A job is running and the engine the studio started is still a running process.
 async fn engine_at_work(state: &AppState) -> bool {
-    let working = state.jobs.read().await.values().any(|job| matches!(job.status, MusicJobStatus::Running));
+    // Queued counts as work too: between one song and the next, the queue is
+    // the only sign the engine is about to be busy, and killing it in that
+    // window - a long step whose /health answer does not come in time, a
+    // machine whose other work starves the engine for a moment - loses the
+    // queued songs with "the engine stopped during this song".
+    let working = state.jobs.read().await.values().any(|job| matches!(job.status, MusicJobStatus::Queued | MusicJobStatus::Running));
     working && state.engine.lock().await.as_mut().is_some_and(|engine| engine.process_alive())
 }
 
