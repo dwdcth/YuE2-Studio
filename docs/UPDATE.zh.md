@@ -21,7 +21,9 @@
 | `main` | 只跟上游 | **永不直接提交**，只 `git pull`（快进）|
 | `linux-headless` | 我们的集成分支 | 所有本地改动都在这里，以 `main` 为基线 rebase |
 
-`origin` = 上游仓库。改动全部固化在少量提交里（`git log origin/main..` 可见），
+远程布局：`origin` = 自己的 fork（https://github.com/dwdcth/YuE2-Studio，
+`linux-headless` 推送于此），`upstream` = 上游 timoncool/YuE2-Studio。
+改动全部固化在少量提交里（`git log upstream/main..` 可见），
 rebase 时按 hunk 解决冲突，不产生长期的 merge 历史。
 
 ## 日常更新（五步，或直接跑脚本）

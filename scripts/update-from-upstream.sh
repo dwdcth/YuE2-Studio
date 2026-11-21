@@ -20,9 +20,9 @@ git diff --quiet && git diff --cached --quiet || { echo "[ERROR] 已跟踪文件
 
 old_pin="$(engine_pin)"
 echo "== 1/5 拉上游"
-git fetch origin
+git fetch upstream
 git tag "backup/$(date +%Y%m%d-%H%M)" 2>/dev/null || true
-git rebase origin/main
+git rebase upstream/main
 
 echo "== 2/5 测试"
 cargo test --workspace
