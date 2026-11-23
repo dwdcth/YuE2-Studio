@@ -12389,10 +12389,9 @@ fn yue_request_from(request: &CreateMusicJobRequest, max_batch: u32) -> Result<V
     body["lm_seed"] = Value::from(request.lm_seed.filter(|seed| *seed >= 0).unwrap_or_else(drawn_seed));
     body["seed"] = Value::from(request.seed.filter(|seed| *seed >= 0).unwrap_or_else(drawn_seed));
     insert_optional(&mut body, "steps", request.steps);
-    if let Some(solver) = request.solver.as_deref() {
-        validate_solver(solver)?;
-        body["solver"] = Value::from(solver);
-    }
+    let solver = request.solver.as_deref().unwrap_or("ab2");
+    validate_solver(solver)?;
+    body["solver"] = Value::from(solver);
     insert_optional(&mut body, "lm_batch_size", request.lm_batch_size);
     insert_optional(&mut body, "synth_batch_size", request.synth_batch_size);
     insert_optional(&mut body, "cfg_scale", request.cfg_scale.filter(|value| *value >= 0.0));

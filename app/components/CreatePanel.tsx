@@ -429,7 +429,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
   const [lmBatch, setLmBatch] = useState(() => keptText(kept, 'lmBatch'));
   const [synthBatch, setSynthBatch] = useState(() => keptText(kept, 'synthBatch'));
   const [steps, setSteps] = useState(() => keptText(kept, 'steps'));
-  const [solver, setSolver] = useState<'' | 'midpoint' | 'ab2'>(() => (kept.solver === 'ab2' || kept.solver === 'midpoint' ? kept.solver : ''));
+  const [solver, setSolver] = useState<'' | 'midpoint' | 'ab2'>(() => (kept.solver === 'ab2' || kept.solver === 'midpoint' ? kept.solver : 'ab2'));
   const [cfgScale, setCfgScale] = useState(() => keptText(kept, 'cfgScale'));
   const [randomizeSeed, setRandomizeSeed] = useState(() => keptFlag(kept, 'randomizeSeed', true));
   const [lmSeed, setLmSeed] = useState(() => keptText(kept, 'lmSeed'));
@@ -611,7 +611,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     setLmBatch('');
     setSynthBatch('');
     setSteps(asText(request.steps));
-    setSolver(request.solver === 'ab2' || request.solver === 'midpoint' ? request.solver : '');
+    setSolver(request.solver === 'ab2' || request.solver === 'midpoint' ? request.solver : 'ab2');
     setCfgScale(typeof request.cfg_scale === 'number' && request.cfg_scale >= 0 ? String(request.cfg_scale) : '');
     const safeSeed = (value: unknown) => (typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : '');
     const storedLmSeed = safeSeed(request.lm_seed);
@@ -730,7 +730,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
    *  user keeps for every song. */
   const resetParameters = (keepChoices = false) => {
     if (!keepChoices) { chooseDuration(String(DEFAULT_DURATION_SECONDS)); chooseFormat('flac'); }
-    setLmBatch(''); setSynthBatch(''); setSteps(''); setSolver(''); setCfgScale('');
+    setLmBatch(''); setSynthBatch(''); setSteps(''); setSolver('ab2'); setCfgScale('');
     setRandomizeSeed(true); setLmSeed(''); setSeed(''); setSemanticTokens('');
     setAbcSampling(emptySampling()); setSemanticSampling(emptySampling()); setHarmony(emptyHarmony());
     setMp3Bitrate('320');
@@ -770,7 +770,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     if (synthBatchValue !== undefined) request.synth_batch_size = synthBatchValue;
     const stepsValue = numberOrUndefined(steps);
     if (stepsValue !== undefined) request.steps = stepsValue;
-    if (solver) request.solver = solver;
+    request.solver = solver || 'ab2';
     const cfgValue = numberOrUndefined(cfgScale);
     if (cfgValue !== undefined) request.cfg_scale = cfgValue;
     // Seeds are drawn here, within 32 bits, so the stored request replays the
@@ -1250,7 +1250,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
     lm_batch_size: [lmBatch, setLmBatch],
     synth_batch_size: [synthBatch, setSynthBatch],
     steps: [steps, setSteps],
-    solver: [solver, value => setSolver(value === 'ab2' || value === 'midpoint' ? value : '')],
+    solver: [solver, value => setSolver(value === 'ab2' || value === 'midpoint' ? value : 'ab2')],
     cfg_scale: [cfgScale, setCfgScale],
     lm_seed: [lmSeed, setLmSeed],
     seed: [seed, setSeed],
@@ -1981,10 +1981,10 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, isGenerati
                 step={1}
                 onChange={setSteps}
               />
-              <Field label={tt('solver')} hint={tt(solver === 'ab2' ? 'solverAb2Hint' : 'solverMidpointHint')}>
-                <select value={solver || 'midpoint'} onChange={event => setSolver(event.target.value as 'midpoint' | 'ab2')} className={CONTROL}>
-                  <option value="midpoint">{tt('solverMidpoint')}</option>
+              <Field label={tt('solver')} hint={tt((solver || 'ab2') === 'ab2' ? 'solverAb2Hint' : 'solverMidpointHint')}>
+                <select value={solver || 'ab2'} onChange={event => setSolver(event.target.value as 'midpoint' | 'ab2')} className={CONTROL}>
                   <option value="ab2">{tt('solverAb2')}</option>
+                  <option value="midpoint">{tt('solverMidpoint')}</option>
                 </select>
               </Field>
             </div>

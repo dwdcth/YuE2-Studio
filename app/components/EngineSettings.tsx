@@ -95,7 +95,7 @@ const DEFAULTS: EngineOptions = {
   chunk_overlap_seconds: null,
   flash_attention: 'auto',
   kv_cache: 'auto',
-  clamp_fp16: false,
+  clamp_fp16: true,
   gpu: null,
   extra_args: '',
   engine_bin: null,

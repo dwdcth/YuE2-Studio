@@ -1,0 +1,368 @@
+diff --git a/src/ggml-cuda/fattn-common.cuh b/src/ggml-cuda/fattn-common.cuh
+index 6774c2f..24372b9 100644
+--- a/src/ggml-cuda/fattn-common.cuh
++++ b/src/ggml-cuda/fattn-common.cuh
+@@ -1170,7 +1170,7 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
+-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
++    const bool scan_mask = !use_sparse && mask && mask->ne[1] > 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+     if (scan_mask) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
+index 07a6db8..ed42b7c 100644
+--- a/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -98,6 +98,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+ }
+ 
+ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 3,  64,  64,  64,  64, 1, true);
++
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  64, 128, 128, 128, 2, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 2, true);
+@@ -680,7 +682,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     } else {
+         // the sparse mask values are gathered per element, always load them synchronously
+         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
+-        if (ncols2 > 1 || mask_h) {
++        if (mask_h) {
+             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+         }
+@@ -780,7 +782,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+ 
+     if constexpr (cols_per_warp == 8) {
+-        if (ncols2 > 1 || mask_h) {
++        if (mask_h) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
+@@ -842,7 +844,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+             }
+         }
+     } else { // not Turing mma or T_B_KQ::I > 8
+-        if (ncols2 > 1 || mask_h) {
++        if (mask_h) {
+ #pragma unroll
+             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+@@ -1447,7 +1449,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         constexpr bool use_cp_async = true;
+         constexpr bool oob_check    = false;
+         constexpr int  k_VKQ_sup    = nbatch_fa;
+-        if (ncols2 > 1 || mask_h) {
++        if (mask_h) {
+             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+         }
+@@ -1477,25 +1479,48 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+     } else {
+-        constexpr bool oob_check = false;
+-        for (; kb0 < kb0_stop-1; ++kb0) {
+-            constexpr bool last_iter = false;
+-            constexpr int  k_VKQ_sup = nbatch_fa;
++        {
++            constexpr bool oob_check = false;
++            for (; kb0 < kb0_stop-1; ++kb0) {
++                constexpr bool last_iter = false;
++                constexpr int  k_VKQ_sup = nbatch_fa;
++                flash_attn_ext_f16_iter
++                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
++                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
++                    (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
++                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
++            }
++        }
++        constexpr bool last_iter = true;
++        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
++        if constexpr (nstages <= 1) {
++            if (k_VKQ_sup < nbatch_fa) {
++                constexpr bool oob_check = true;
++                flash_attn_ext_f16_iter
++                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
++                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
++                    (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
++                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
++            } else {
++                constexpr bool oob_check = false;
++                flash_attn_ext_f16_iter
++                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
++                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
++                    (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
++                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
++                     KQ_max, KQ_rowsum, jt, kb0, nbatch_fa);
++            }
++        } else {
++            constexpr bool oob_check = false;
+             flash_attn_ext_f16_iter
+                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
++                 KQ_max, KQ_rowsum, jt, kb0, nbatch_fa);
+         }
+-        constexpr bool last_iter = true;
+-        constexpr int  k_VKQ_sup = nbatch_fa;
+-        flash_attn_ext_f16_iter
+-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+     }
+ 
+     // With multi-stage loading there is no __syncthreads at the end of the iter,
+@@ -1966,7 +1991,7 @@ static __global__ void flash_attn_ext_f16(
+ #endif // VOLTA_MMA_AVAILABLE
+ 
+ #if __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+-    if (ncols1*ncols2 > 32) {
++    if (ncols1*ncols2 > 32 && !(DKQ == 128 && ncols1*ncols2 == 64)) {
+         NO_DEVICE_CODE;
+         return;
+     }
+@@ -1997,7 +2022,7 @@ static __global__ void flash_attn_ext_f16(
+     const int stride_Q1   = nb01 / sizeof(float2);
+     const int stride_Q2   = nb02 / sizeof(float2);
+     const int stride_K    = nb11 / sizeof(half2);
+-    const int stride_mask = nb31 / sizeof(half);
++    const int stride_mask = (ne31 == 1) ? 0 : (nb31 / sizeof(half));
+ 
+     const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+ 
+@@ -2032,8 +2057,8 @@ static __global__ void flash_attn_ext_f16(
+ 
+         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+-        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+-            (const half *) (mask + nb33*(sequence % ne33));
++        const half   * mask_h = mask ?
++            (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+ 
+         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+@@ -2150,7 +2175,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(stride_tile_K,  stride_tile_V) * sizeof(half2);
+     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (stride_tile_K + stride_tile_V) * sizeof(half2);
+     const size_t nbytes_shared_Q         = ncols                * (DKQp/2 + 4)                            * sizeof(half2);
+-    const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
++    const size_t nbytes_shared_mask      = dst->src[3] ? ncols1 * (nbatch_fa/2 + 4) * sizeof(half2) : 0;
+     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
+ 
+     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
+diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
+index cf44ab4..7cd9c2f 100644
+--- a/src/ggml-cuda/fattn.cu
++++ b/src/ggml-cuda/fattn.cu
+@@ -198,7 +198,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
+         }
+     }
+ 
+-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
++    static const bool yue_fa_ncols64 = getenv("YUE_FA_NCOLS64") != nullptr;
++    if (Q->ne[1] <= 32/ncols2 || (!yue_fa_ncols64 && GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+         return;
+@@ -224,7 +225,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+ 
+     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
+     //     are put into the template specialization without GQA optimizations.
+-    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
++    // On Turing (no cp_async), allow unmasked unpadded DKQ==128 bidirectional attention with GQA opt.
++    const bool allow_unmasked_gqa = !mask && DKQ == 128 && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
++    bool use_gqa_opt = (mask ? (n_kv % FATTN_KQ_STRIDE == 0) : allow_unmasked_gqa) && max_bias == 0.0f;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+@@ -608,7 +611,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+ 
+     // The effective batch size for the kernel can be increased by gqa_ratio.
+     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
+-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
++    const int cc = ggml_cuda_info().devices[device].cc;
++    const bool allow_unmasked_gqa = !mask && K->ne[0] == 128 && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
++    bool gqa_opt_applies = gqa_ratio >= 2 && (mask ? (n_kv % FATTN_KQ_STRIDE == 0) : allow_unmasked_gqa) && max_bias == 0.0f;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+@@ -621,8 +626,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         }
+     }
+ 
+-    const int cc = ggml_cuda_info().devices[device].cc;
+-
+     switch (K->ne[0]) {
+         case  40:
+         case  64:
+@@ -698,7 +701,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+                 const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&
+                     ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
+                     ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
+-                if (!sparse_decode && cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 &&
++                static const bool yue_fa_vec = getenv("YUE_FA_VEC_DECODE") != nullptr;
++                if (!sparse_decode && (cc >= GGML_CUDA_CC_ADA_LOVELACE || yue_fa_vec) && Q->ne[1] == 1 && Q->ne[3] == 1 &&
+                         !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192))) {
+                     return BEST_FATTN_KERNEL_VEC;
+                 }
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 72a8632..e9f6777 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1931,7 +1931,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        static const bool force_acc32 = getenv("YUE_CUBLAS_F16_ACC32") != nullptr;
++        prefer_f32_output = force_acc32 || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4_M(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+@@ -2519,6 +2520,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
+         return;
+     }
++    static const int yue_force_cublas = [] {
++        const char * e = getenv("YUE_FORCE_CUBLAS");
++        return e ? atoi(e) : 0;
++    }();
++    if (yue_force_cublas && ne11 > 16) {
++        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
++        return;
++    }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+@@ -5296,6 +5305,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 stream_ctx.concurrent_events.clear();
+             }
+ 
++            static const int yue_profile_limit = [] {
++                const char * e = getenv("YUE_PROFILE");
++                return e ? atoi(e) : 0;
++            }();
++            static std::unordered_map<int, int> yue_prof_seen;
++            const bool do_prof = yue_profile_limit > 0 && cgraph->n_nodes > 100 && (++yue_prof_seen[cgraph->n_nodes] <= yue_profile_limit);
++            struct YueProfEntry {
++                double ms    = 0.0;
++                int    count = 0;
++            };
++            std::unordered_map<std::string, YueProfEntry> prof_map;
++            cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
++            if (do_prof) {
++                CUDA_CHECK(cudaEventCreate(&ev_start));
++                CUDA_CHECK(cudaEventCreate(&ev_stop));
++                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++            }
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+ #ifdef USE_CUDA_GRAPH
+@@ -5347,9 +5373,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (do_prof) {
++                    CUDA_CHECK(cudaEventRecord(ev_start, cuda_ctx->stream()));
++                }
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (do_prof) {
++                        CUDA_CHECK(cudaEventRecord(ev_stop, cuda_ctx->stream()));
++                        CUDA_CHECK(cudaEventSynchronize(ev_stop));
++                        float dt = 0.0f;
++                        CUDA_CHECK(cudaEventElapsedTime(&dt, ev_start, ev_stop));
++                        char key[160];
++                        snprintf(key, sizeof(key), "FUSED(%d):%s->%s [%lldx%lld]", nodes_to_skip + 1,
++                                 ggml_op_name(node->op), ggml_op_name(cgraph->nodes[i + nodes_to_skip]->op),
++                                 (long long) cgraph->nodes[i + nodes_to_skip]->ne[0],
++                                 (long long) cgraph->nodes[i + nodes_to_skip]->ne[1]);
++                        auto & e = prof_map[key];
++                        e.ms += dt;
++                        e.count++;
++                    }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -5377,6 +5420,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #endif  // NDEBUG
+ 
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
++                if (do_prof) {
++                    CUDA_CHECK(cudaEventRecord(ev_stop, cuda_ctx->stream()));
++                    CUDA_CHECK(cudaEventSynchronize(ev_stop));
++                    float dt = 0.0f;
++                    CUDA_CHECK(cudaEventElapsedTime(&dt, ev_start, ev_stop));
++                    char key[160];
++                    if (node->op == GGML_OP_MUL_MAT) {
++                        snprintf(key, sizeof(key), "MUL_MAT(%s) [%lldx%lld]*[%lld]",
++                                 ggml_type_name(node->src[0]->type),
++                                 (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
++                                 (long long) node->src[1]->ne[1]);
++                    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
++                        snprintf(key, sizeof(key), "FLASH_ATTN(K:%s) Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld]",
++                                 ggml_type_name(node->src[1]->type),
++                                 (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], (long long) node->src[0]->ne[2],
++                                 (long long) node->src[1]->ne[0], (long long) node->src[1]->ne[1], (long long) node->src[1]->ne[2]);
++                    } else {
++                        snprintf(key, sizeof(key), "%s [%lld,%lld,%lld]",
++                                 ggml_op_name(node->op),
++                                 (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
++                    }
++                    auto & e = prof_map[key];
++                    e.ms += dt;
++                    e.count++;
++                }
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+@@ -5386,6 +5454,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     try_launch_concurrent_event(node);
+                }
+             }
++            if (do_prof) {
++                CUDA_CHECK(cudaEventDestroy(ev_start));
++                CUDA_CHECK(cudaEventDestroy(ev_stop));
++                std::vector<std::pair<std::string, YueProfEntry>> items(prof_map.begin(), prof_map.end());
++                std::sort(items.begin(), items.end(), [](const auto & a, const auto & b) {
++                    return a.second.ms > b.second.ms;
++                });
++                double total_ms = 0.0;
++                int total_ops = 0;
++                for (const auto & kv : items) {
++                    total_ms += kv.second.ms;
++                    total_ops += kv.second.count;
++                }
++                fprintf(stderr, "\n[YUE-PROF] graph nodes=%d (executed=%d ops), total GPU=%.2f ms:\n",
++                        cgraph->n_nodes, total_ops, total_ms);
++                for (size_t k = 0; k < items.size() && k < 25; k++) {
++                    fprintf(stderr, "  %6.2f ms (%5.1f%%) x%-4d %s\n",
++                            items[k].second.ms, 100.0 * items[k].second.ms / (total_ms > 0 ? total_ms : 1.0),
++                            items[k].second.count, items[k].first.c_str());
++                }
++                fflush(stderr);
++            }
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+@@ -5452,7 +5542,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    static const bool yue_prof_disables_graph = getenv("YUE_PROFILE") != nullptr;
++    if (!yue_prof_disables_graph && graph->is_enabled()) {
+         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
+         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
+         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);

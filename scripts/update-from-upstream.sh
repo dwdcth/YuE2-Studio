@@ -45,3 +45,6 @@ echo "== 5/5 完成。重启两个进程（本 fork 只做 server 模式，不�
 echo "    YUE_STUDIO_HEADLESS=1 YUE_ENGINE_ROOT=\$HOME/yue2-engine \\"
 echo "      $service &"
 echo "    cd app && npm run dev &      # UI: http://<机器IP>:3791"
+echo ""
+echo "    若变基通过且验证无误，推送到自己远程 fork："
+echo "    git push origin linux-headless --force-with-lease"

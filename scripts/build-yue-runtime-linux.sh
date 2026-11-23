@@ -32,6 +32,17 @@ git -C "$worktree" fetch --quiet origin "$commit" || git -C "$worktree" fetch --
 git -C "$worktree" checkout --quiet "$commit"
 git -C "$worktree" submodule update --init --recursive
 
+patch_dir="$root/engines/patches/yue2"
+if [ -d "$patch_dir" ]; then
+    echo "[INFO] Applying performance patches to yue2.cpp and ggml..."
+    if [ -f "$patch_dir/yue2_2080ti.patch" ]; then
+        git -C "$worktree" apply --ignore-whitespace "$patch_dir/yue2_2080ti.patch" 2>/dev/null || echo "[INFO] yue2 patch already applied or skipped"
+    fi
+    if [ -f "$patch_dir/ggml_2080ti.patch" ]; then
+        git -C "$worktree/ggml" apply --ignore-whitespace "$patch_dir/ggml_2080ti.patch" 2>/dev/null || echo "[INFO] ggml patch already applied or skipped"
+    fi
+fi
+
 cmake -S "$worktree" -B "$worktree/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
     -DCMAKE_BUILD_RPATH='$ORIGIN' -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
@@ -55,7 +66,8 @@ backend="vulkan"
 if command -v nvcc >/dev/null 2>&1; then
     rm -rf "$worktree/build-linux-cuda13"
     cmake -S "$worktree" -B "$worktree/build-linux-cuda13" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_ALL_QUANTS=ON \
+        -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF \
+        -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_FA_QUANTS="f16-f16;q8_0-q8_0" \
         "-DCMAKE_CUDA_ARCHITECTURES=$cuda_architectures" \
         -DCMAKE_BUILD_RPATH='$ORIGIN:$ORIGIN/..' -DCMAKE_INSTALL_RPATH='$ORIGIN:$ORIGIN/..' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     cmake --build "$worktree/build-linux-cuda13" --config Release --target ggml-cuda -j "$(getconf _NPROCESSORS_ONLN)"

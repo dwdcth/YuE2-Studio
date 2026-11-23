@@ -559,6 +559,11 @@ impl YueServerSupervisor {
                 command.env_remove("YUE_CUDA_BACKEND");
             }
         }
+        // Optimized engine environment for Turing SM 7.5 / 2080 Ti:
+        if std::env::var("YUE_FA_NCOLS64").is_err() { command.env("YUE_FA_NCOLS64", "1"); }
+        if std::env::var("YUE_NAR_F16_WEIGHTS").is_err() { command.env("YUE_NAR_F16_WEIGHTS", "1"); }
+        if std::env::var("YUE_NAR_NO_MASK").is_err() { command.env("YUE_NAR_NO_MASK", "1"); }
+        if std::env::var("YUE_FA_VEC_DECODE").is_err() { command.env("YUE_FA_VEC_DECODE", "1"); }
         if let Some(device) = self.config.options.backend.ggml_device() {
             command.arg("--device").arg(device);
         }

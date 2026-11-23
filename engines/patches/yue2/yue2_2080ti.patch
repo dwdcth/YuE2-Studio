@@ -1,0 +1,1194 @@
+diff --git a/ggml b/ggml
+--- a/ggml
++++ b/ggml
+@@ -1 +1 @@
+-Subproject commit 1cbd79adc5b3ca65eff7a913e73209226289025d
++Subproject commit 1cbd79adc5b3ca65eff7a913e73209226289025d-dirty
+diff --git a/src/backend.h b/src/backend.h
+index 7783cab..4f6acda 100644
+--- a/src/backend.h
++++ b/src/backend.h
+@@ -66,8 +66,9 @@ static ggml_backend_t cpu_backend_new(int n_threads) {
+ // count when the run ends (tames the CUDA graph capture "reused" flood).
+ static void yue2_ggml_log(enum ggml_log_level level, const char * text, void * user_data) {
+     (void) user_data;
+-    // Debug chatter (CUDA graph reuse and friends) stays silent
+-    if (level == GGML_LOG_LEVEL_DEBUG) {
++    // Debug chatter (CUDA graph reuse and friends) stays silent unless GGML_CUDA_GRAPH_DEBUG is set
++    static const bool show_debug = std::getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
++    if (level == GGML_LOG_LEVEL_DEBUG && !show_debug) {
+         return;
+     }
+     static char last[256] = { 0 };
+diff --git a/src/generate.h b/src/generate.h
+index 6d11ab0..739a133 100644
+--- a/src/generate.h
++++ b/src/generate.h
+@@ -177,6 +177,8 @@ static bool yue2_generate(Qwen3LM *                             lm,
+     const bool                    steered = harmony && phase == YUE2_PHASE_ABC && harmony->cfg.active();
+     std::vector<Yue2HarmonyState> chords(steered ? (size_t) B : 0);
+     std::vector<float>            steered_logits;
++    g_ar_timing = {};
++    double ar_sample_ms = 0.0;
+     int                        step = carried_n;
+     for (;; step++) {
+         if (cancelled && cancelled(cancel_data)) {
+@@ -205,8 +207,10 @@ static bool yue2_generate(Qwen3LM *                             lm,
+                         logits = steered_logits.data();
+                     }
+                 }
++                Timer t_smp;
+                 yue2_distribution(logits, s, g.tokens, step, phase, candidates);
+                 int token = yue2_draw(candidates, seed + i, step);
++                ar_sample_ms += t_smp.ms();
+                 tokens[i] = token;
+                 if (token == end) {
+                     g.truncated = false;
+@@ -256,5 +260,15 @@ static bool yue2_generate(Qwen3LM *                             lm,
+     }
+     fprintf(stderr, "[AR] %s: %zu tokens over %d songs, %d steps, %.1f s (%.1f ms/step)\n", label, total, B, step,
+             timer.ms() / 1000.0, step > 0 ? timer.ms() / step : 0.0);
++    if (std::getenv("YUE_TIMING") != nullptr && g_ar_timing.steps > 0) {
++        double st = (double) g_ar_timing.steps;
++        fprintf(stderr,
++                "[AR-TIMING] %s (%d steps, %d builds): build=%.1fms (%.3f/s) h2d=%.1fms (%.3f/s) mask=%.1fms (%.3f/s) "
++                "compute=%.1fms (%.3f/s) d2h=%.1fms (%.3f/s) sample=%.1fms (%.3f/s) direct=%d\n",
++                label, g_ar_timing.steps, g_ar_timing.builds, g_ar_timing.build_ms, g_ar_timing.build_ms / st,
++                g_ar_timing.h2d_ms, g_ar_timing.h2d_ms / st, g_ar_timing.mask_ms, g_ar_timing.mask_ms / st,
++                g_ar_timing.compute_ms, g_ar_timing.compute_ms / st, g_ar_timing.d2h_ms, g_ar_timing.d2h_ms / st,
++                ar_sample_ms, ar_sample_ms / st, (int) lm->batch_graph.graph.direct);
++    }
+     return true;
+ }
+diff --git a/src/nar.h b/src/nar.h
+index 347a575..aab6bf5 100644
+--- a/src/nar.h
++++ b/src/nar.h
+@@ -70,19 +70,36 @@ struct Yue2NAR {
+     ggml_backend_sched_t  sched;
+ 
+     // Graph cache: the ODE replays one shape for every one of its evaluations
+-    GraphArena           arena;       // stable node addresses across rebuilds
+-    struct ggml_cgraph * graph;
+-    struct ggml_tensor * in_x;        // [latent_dim, N_nar, M]
+-    struct ggml_tensor * in_time;     // [256]
+-    struct ggml_tensor * in_pos_emb;  // [H, N_nar]
+-    struct ggml_tensor * in_pos;      // [N_nar] i32
+-    struct ggml_tensor * in_mask;     // [pad(ar_len + N_nar), pad(N_nar)] f16, -inf on the padded keys
+-    struct ggml_tensor * in_kv_zero;  // [head_dim, padded keys, n_kv_heads, 1] f16 zeros, null without padding
+-    struct ggml_tensor * out_v;       // [latent_dim, T_lat, M]
+-    int                  graph_T;     // cached T_lat (0 = no cache)
+-    int                  graph_M;     // cached variation count
+-    int                  graph_ar;    // cached ar_len
+-    int                  graph_set;   // cached KV set
++    GraphArena            arena;  // stable node addresses across rebuilds
++    StaticGraph           static_graph;
++    struct ggml_cgraph *  graph;
++    struct ggml_tensor *  in_x;        // [latent_dim, N_nar, M]
++    struct ggml_tensor *  in_time;     // [256]
++    struct ggml_tensor *  in_pos_emb;  // [H, N_nar]
++    struct ggml_tensor *  in_pos;      // [N_nar] i32
++    struct ggml_tensor *  in_mask;     // [pad(ar_len + N_nar), 1 or pad(N_nar)] f16
++    struct ggml_tensor *  in_kv_zero;  // [head_dim, padded keys, n_kv_heads, 1] f16 zeros, null without padding
++    struct ggml_tensor *  out_v;       // [latent_dim, T_lat, M]
++    int                   graph_T;     // cached T_lat (0 = no cache)
++    int                   graph_M;     // cached variation count
++    int                   graph_ar;    // cached ar_len
++    int                   graph_set;   // cached KV set
++    uint64_t              graph_kv_epoch;
++    bool                  graph_built;
++    bool                  graph_dbg;
++    bool                  graph_inplace_kv;
++
++    // Optional pre-materialized F16 KV buffer (used when M > 1 or kv->type != F16)
++    struct ggml_context * kv_ctx;
++    ggml_backend_buffer_t kv_buf;
++    struct ggml_tensor *  kv_k[QW3LM_MAX_LAYERS];
++    struct ggml_tensor *  kv_v[QW3LM_MAX_LAYERS];
++    int                   kv_keys;
++    int                   kv_M;
++
++    // Optional F16-converted layer weights for cuBLAS FP16 Tensor Core path
++    struct ggml_context * f16_wctx;
++    ggml_backend_buffer_t f16_wbuf;
+ 
+     std::vector<float>   scratch_x;
+     std::vector<float>   scratch_pos_emb;
+@@ -115,7 +132,7 @@ static void nar_load_layer(WeightCtx *         wctx,
+     ly->q_norm = gf_load_tensor_f32(wctx, gf, prefix + ".nar_self_attn.q_norm.weight");
+     ly->k_norm = gf_load_tensor_f32(wctx, gf, prefix + ".nar_self_attn.k_norm.weight");
+ 
+-    ly->gate_up =
++    ly->gate_up = std::getenv("YUE_NO_FUSE_GATE_UP") ? nullptr :
+         gf_load_pair_fused(wctx, gf, prefix + ".nar_mlp.gate_proj.weight", prefix + ".nar_mlp.up_proj.weight");
+     if (!ly->gate_up) {
+         ly->gate_proj = gf_load_tensor(wctx, gf, prefix + ".nar_mlp.gate_proj.weight");
+@@ -184,6 +201,72 @@ static bool nar_load(Yue2NAR * n, const char * gguf_path, const std::vector<Adap
+         return false;
+     }
+     gf_close(&gf);
++
++    // Optional: pre-dequantize quantized NAR linear weights to F16 once at load time
++    // so cuBLAS FP16 Tensor Cores run with zero per-evaluation weight dequantization.
++    if (std::getenv("YUE_NAR_F16_WEIGHTS") != nullptr) {
++        Timer t_f16;
++        std::vector<struct ggml_tensor **> ptrs;
++        ptrs.reserve((size_t) n->cfg.n_layers * 6);
++        auto add_q = [&](struct ggml_tensor ** p) {
++            if (*p && ggml_is_quantized((*p)->type)) {
++                ptrs.push_back(p);
++            }
++        };
++        for (int l = 0; l < n->cfg.n_layers; l++) {
++            Qwen3Layer * ly = &n->layers[l];
++            add_q(&ly->qkv);
++            add_q(&ly->qk);
++            add_q(&ly->q_proj);
++            add_q(&ly->k_proj);
++            add_q(&ly->v_proj);
++            add_q(&ly->o_proj);
++            add_q(&ly->gate_up);
++            add_q(&ly->gate_proj);
++            add_q(&ly->up_proj);
++            add_q(&ly->down_proj);
++        }
++        if (!ptrs.empty()) {
++            struct ggml_init_params fp = { ggml_tensor_overhead() * (ptrs.size() + 4), NULL, true };
++            n->f16_wctx = ggml_init(fp);
++            std::vector<struct ggml_tensor *> f16_tensors;
++            f16_tensors.reserve(ptrs.size());
++            size_t total_f16 = 0;
++            for (struct ggml_tensor ** p : ptrs) {
++                struct ggml_tensor * old_w = *p;
++                struct ggml_tensor * nw    = ggml_new_tensor(n->f16_wctx, GGML_TYPE_F16, ggml_n_dims(old_w), old_w->ne);
++                f16_tensors.push_back(nw);
++                total_f16 += ggml_nbytes(nw);
++            }
++            n->f16_wbuf = ggml_backend_alloc_ctx_tensors(n->f16_wctx, n->backend);
++            if (n->f16_wbuf) {
++                ggml_backend_buffer_set_usage(n->f16_wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(n->backend));
++                size_t gmem = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(16, false);
++                for (size_t i = 0; i < ptrs.size(); i++) {
++                    struct ggml_init_params gp = { gmem, NULL, true };
++                    struct ggml_context *   gc = ggml_init(gp);
++                    struct ggml_cgraph *    cg = ggml_new_graph_custom(gc, 16, false);
++                    struct ggml_tensor *    f32 = ggml_cast(gc, *ptrs[i], GGML_TYPE_F32);
++                    struct ggml_tensor *    cp  = ggml_cpy(gc, f32, f16_tensors[i]);
++                    ggml_build_forward_expand(cg, cp);
++                    ggml_gallocr_alloc_graph(ga, cg);
++                    ggml_backend_graph_compute(n->backend, cg);
++                    ggml_free(gc);
++                    *ptrs[i] = f16_tensors[i];
++                }
++                ggml_backend_synchronize(n->backend);
++                ggml_gallocr_free(ga);
++                fprintf(stderr, "[NAR] Pre-converted %zu weights to F16 (%.1f MB) in %.1f ms\n", ptrs.size(),
++                        (double) total_f16 / (1024.0 * 1024.0), t_f16.ms());
++            } else {
++                ggml_free(n->f16_wctx);
++                n->f16_wctx = nullptr;
++                fprintf(stderr, "[NAR] WARNING: F16 weight buffer alloc failed, keeping quantized weights\n");
++            }
++        }
++    }
++
+     fprintf(stderr, "[NAR] Loaded: %d layers, latent_dim=%d, timestep_shift=%.3f\n", n->cfg.n_layers, n->latent_dim,
+             n->timestep_shift);
+     return true;
+@@ -236,22 +319,22 @@ static struct ggml_tensor * nar_linear_bias(struct ggml_context * ctx,
+     return ggml_add(ctx, ggml_mul_mat(ctx, w, x), b);
+ }
+ 
+-// NAR attention: fresh Q/K/V for the latent block of every variation,
+-// concatenated with the AR prefix window of the cache, which every variation
+-// reads. The graph only reads the cache, so there is no write to order against
+-// the read and the hazard cannot exist.
++// NAR attention: fresh Q/K/V for the latent block of every variation written
++// directly into [ar_len .. ar_len + N) of the pre-populated contiguous KV
++// tensor (either in-place in kv->k/v for M==1 F16, or in n->kv_k/v otherwise).
+ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
++                                           struct ggml_cgraph *  gf,
+                                            const Qwen3LMConfig & c,
+                                            Qwen3Layer *          ly,
+                                            struct ggml_tensor *  x,          // [H, N, M]
+                                            struct ggml_tensor *  positions,  // [N]
+-                                           struct ggml_tensor *  mask,       // [pad(ar_len + N), pad(N)] f16
+-                                           struct ggml_tensor *  kv_zero,    // zero keys up to the padded count, or null
+-                                           struct ggml_tensor *  cache_k,    // [D, max_seq, Nkv] f16
+-                                           struct ggml_tensor *  cache_v,
++                                           struct ggml_tensor *  mask,       // [keys, 1 or pad(N)] f16
++                                           struct ggml_tensor *  kv_k_buf,   // [D, >=keys, Nkv, M] f16
++                                           struct ggml_tensor *  kv_v_buf,   // [D, >=keys, Nkv, M] f16
+                                            int                   ar_len,
+                                            int                   N,
+                                            int                   M,
++                                           int                   keys,
+                                            bool                  use_flash_attn,
+                                            bool                  clamp_fp16) {
+     int D   = c.head_dim;
+@@ -263,20 +346,25 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
+     int                 kv_dim = Nkv * D;
+     if (ly->qkv) {
+         struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x);
+-        q                        = ggml_cont(ctx, ggml_view_3d(ctx, qkv, q_dim, N, M, qkv->nb[1], qkv->nb[2], 0));
+-        k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, kv_dim, N, M, qkv->nb[1], qkv->nb[2], (size_t) q_dim * qkv->nb[0]));
+-        v = ggml_cont(
+-            ctx, ggml_view_3d(ctx, qkv, kv_dim, N, M, qkv->nb[1], qkv->nb[2], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
++        if (clamp_fp16) {
++            qkv = ggml_clamp(ctx, qkv, -65504.0f, 65504.0f);
++        }
++        // Zero-copy 4D views directly into qkv: contiguous rows of length D for rms_norm/rope
++        q = ggml_view_4d(ctx, qkv, D, Nh, N, M, (size_t) D * qkv->nb[0], qkv->nb[1], qkv->nb[2], 0);
++        k = ggml_view_4d(ctx, qkv, D, Nkv, N, M, (size_t) D * qkv->nb[0], qkv->nb[1], qkv->nb[2],
++                         (size_t) q_dim * qkv->nb[0]);
++        v = ggml_view_4d(ctx, qkv, D, Nkv, N, M, (size_t) D * qkv->nb[0], qkv->nb[1], qkv->nb[2],
++                         (size_t) (q_dim + kv_dim) * qkv->nb[0]);
+     } else {
+-        q = qwen3_linear(ctx, ly->q_proj, x);
+-        k = qwen3_linear(ctx, ly->k_proj, x);
+-        v = qwen3_linear(ctx, ly->v_proj, x);
++        q = ggml_reshape_4d(ctx, qwen3_linear(ctx, ly->q_proj, x), D, Nh, N, M);
++        k = ggml_reshape_4d(ctx, qwen3_linear(ctx, ly->k_proj, x), D, Nkv, N, M);
++        struct ggml_tensor * v_lin = qwen3_linear(ctx, ly->v_proj, x);
++        if (clamp_fp16) {
++            v_lin = ggml_clamp(ctx, v_lin, -65504.0f, 65504.0f);
++        }
++        v = ggml_reshape_4d(ctx, v_lin, D, Nkv, N, M);
+     }
+ 
+-    q = ggml_reshape_4d(ctx, q, D, Nh, N, M);
+-    k = ggml_reshape_4d(ctx, k, D, Nkv, N, M);
+-    v = ggml_reshape_4d(ctx, v, D, Nkv, N, M);
+-
+     q = ggml_rms_norm(ctx, q, c.rms_norm_eps);
+     q = ggml_mul(ctx, q, qwen3_f32(ctx, ly->q_norm));
+     k = ggml_rms_norm(ctx, k, c.rms_norm_eps);
+@@ -285,49 +373,33 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
+     q = ggml_rope_ext(ctx, q, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+     k = ggml_rope_ext(ctx, k, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+ 
+-    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [D, N, Nh, M]
+-    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [D, N, Nkv, M]
+-    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+-
+-    // Clamp V before the F16 cast: the clamp kernels walk contiguous memory
+-    if (clamp_fp16) {
+-        v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
++    // Permute Q to [D, N, Nh, M]. CUDA flash_attn_ext reads strided Q directly without ggml_cont!
++    q = ggml_permute(ctx, q, 0, 2, 1, 3);
++    if (!use_flash_attn) {
++        q = ggml_cont(ctx, q);
+     }
+-    k = ggml_cast(ctx, k, GGML_TYPE_F16);
+-    v = ggml_cast(ctx, v, GGML_TYPE_F16);
+ 
+-    // AR prefix rows of the cache as f16, repeated per variation. A quantized
+-    // cache is read back through f32: the concat below takes one type.
+-    struct ggml_tensor * k_ar = ggml_view_3d(ctx, cache_k, D, ar_len, Nkv, cache_k->nb[1], cache_k->nb[2], 0);
+-    struct ggml_tensor * v_ar = ggml_view_3d(ctx, cache_v, D, ar_len, Nkv, cache_v->nb[1], cache_v->nb[2], 0);
+-    if (cache_k->type == GGML_TYPE_F16) {
+-        k_ar = ggml_cont(ctx, k_ar);
+-        v_ar = ggml_cont(ctx, v_ar);
+-    } else {
+-        k_ar = ggml_cast(ctx, ggml_cast(ctx, k_ar, GGML_TYPE_F32), GGML_TYPE_F16);
+-        v_ar = ggml_cast(ctx, ggml_cast(ctx, v_ar, GGML_TYPE_F32), GGML_TYPE_F16);
+-    }
+-    if (M > 1) {
+-        struct ggml_tensor * shape = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, ar_len, Nkv, M);
+-        k_ar                       = ggml_repeat(ctx, k_ar, shape);
+-        v_ar                       = ggml_repeat(ctx, v_ar, shape);
+-    }
++    // Permute K and V to [D, N, Nkv, M] and write directly into [ar_len .. ar_len+N) of the
++    // F16 KV buffer via ggml_cpy (fuses permute + F32->F16 cast + scatter into one kernel!).
++    struct ggml_tensor * k_perm = ggml_permute(ctx, k, 0, 2, 1, 3);
++    struct ggml_tensor * v_perm = ggml_permute(ctx, v, 0, 2, 1, 3);
+ 
+-    struct ggml_tensor * k_full = ggml_concat(ctx, k_ar, k, 1);
+-    struct ggml_tensor * v_full = ggml_concat(ctx, v_ar, v, 1);
+-    if (kv_zero) {
+-        struct ggml_tensor * zero = kv_zero;
+-        if (M > 1) {
+-            zero = ggml_repeat(ctx, kv_zero, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, kv_zero->ne[1], Nkv, M));
+-        }
+-        k_full = ggml_concat(ctx, k_full, zero, 1);
+-        v_full = ggml_concat(ctx, v_full, zero, 1);
+-    }
++    struct ggml_tensor * k_slot = ggml_view_4d(ctx, kv_k_buf, D, N, Nkv, M, kv_k_buf->nb[1], kv_k_buf->nb[2],
++                                               kv_k_buf->nb[3], (size_t) ar_len * kv_k_buf->nb[1]);
++    struct ggml_tensor * v_slot = ggml_view_4d(ctx, kv_v_buf, D, N, Nkv, M, kv_v_buf->nb[1], kv_v_buf->nb[2],
++                                               kv_v_buf->nb[3], (size_t) ar_len * kv_v_buf->nb[1]);
++    ggml_build_forward_expand(gf, ggml_cpy(ctx, k_perm, k_slot));
++    ggml_build_forward_expand(gf, ggml_cpy(ctx, v_perm, v_slot));
++
++    struct ggml_tensor * k_full =
++        ggml_view_4d(ctx, kv_k_buf, D, keys, Nkv, M, kv_k_buf->nb[1], kv_k_buf->nb[2], kv_k_buf->nb[3], 0);
++    struct ggml_tensor * v_full =
++        ggml_view_4d(ctx, kv_v_buf, D, keys, Nkv, M, kv_v_buf->nb[1], kv_v_buf->nb[2], kv_v_buf->nb[3], 0);
+ 
+     float                scale = 1.0f / sqrtf((float) D);
+     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f) :
+                                                   qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale);
+-    if (use_flash_attn) {
++    if (use_flash_attn && !std::getenv("YUE_FA_PREC_DEFAULT")) {
+         ggml_prec_set_acc(attn, GGML_PREC_F32);
+     }
+ 
+@@ -335,38 +407,119 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
+     return qwen3_linear(ctx, ly->o_proj, attn);
+ }
+ 
+-// Build the velocity graph of M variations of a T_lat frame block over the
+-// AR prefix of KV set kv_set. The frame inputs hold for a shape (T_lat,
+-// ar_len), the graph itself is rebuilt at every evaluation.
+-static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int M, int ar_len, int kv_set) {
+-    bool                  new_shape = (n->graph_T != T_lat || n->graph_ar != ar_len);
+-    bool                  new_key   = new_shape || n->graph_M != M || n->graph_set != kv_set;
+-    const Qwen3LMConfig & c         = n->cfg;
+-    int                   H         = c.hidden_size;
+-    int                   N         = T_lat + 2;
++// Prepare static AR prefix + trailing zero padding in the KV buffer ONCE per chunk
++// before the ODE loop, then build & allocate the static graph once.
++static bool nar_prepare_chunk(Yue2NAR *            n,
++                              const Qw3lmKvCache * kv,
++                              int                  T_lat,
++                              int                  M,
++                              int                  ar_len,
++                              int                  kv_set,
++                              bool                 dbg_enabled) {
++    const Qwen3LMConfig & c    = n->cfg;
++    int                   H    = c.hidden_size;
++    int                   D    = c.head_dim;
++    int                   Nkv  = c.n_kv_heads;
++    int                   N       = T_lat + 2;
++    const bool            no_mask = n->use_flash_attn && std::getenv("YUE_NAR_NO_MASK") != nullptr;
++    int                   keys = no_mask ? (ar_len + N) :
++                                           (ar_len + N + YUE2_NAR_KV_PAD - 1) / YUE2_NAR_KV_PAD * YUE2_NAR_KV_PAD;
+ 
+     if (ar_len < 1 || ar_len + N > kv->cfg.max_seq_len) {
+         fprintf(stderr, "[NAR] FATAL: prefix %d plus latent block %d exceeds the context %d\n", ar_len, N,
+                 kv->cfg.max_seq_len);
+         return false;
+     }
+-    // Rewinding the arena rebuilds every node at the address it already had,
+-    // so the backend graph cache resolves to the same executable at every
+-    // evaluation of the ODE instead of thrashing on fresh allocations.
+-    ggml_backend_sched_reset(n->sched);
+-    struct ggml_context * ctx = graph_arena_begin(&n->arena);
+-    struct ggml_cgraph *  gf  = ggml_new_graph_custom(ctx, YUE2_NAR_GRAPH_NODES, false);
+ 
+-    n->in_x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n->latent_dim, N, M);
+-    ggml_set_name(n->in_x, "nar_x");
+-    ggml_set_input(n->in_x);
+-    n->in_time = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, YUE2_TIME_EMBED_DIM);
+-    ggml_set_name(n->in_time, "nar_time");
+-    ggml_set_input(n->in_time);
+-    // Frame embedding and index tensors hold for the whole ODE: they live in
+-    // their own buffer, so the graph allocation of each evaluation leaves them
+-    // in place and they are uploaded once per shape.
+-    if (new_shape) {
++    const bool can_inplace =
++        (M == 1 && kv->type == GGML_TYPE_F16 && keys <= kv->cfg.max_seq_len && !std::getenv("YUE_NAR_NO_INPLACE_KV"));
++
++    // 1. Prepare KV backing: either zero tail in-place (M==1 F16) or copy/dequant AR prefix once into n->kv_buf
++    if (can_inplace) {
++        const int pad = keys - ar_len - N;
++        if (pad > 0) {
++            std::vector<uint16_t> zeros((size_t) D * pad, 0);
++            const size_t          bytes = zeros.size() * sizeof(uint16_t);
++            for (int l = 0; l < c.n_layers; l++) {
++                struct ggml_tensor * ck = kv->k[kv_set][l];
++                struct ggml_tensor * cv = kv->v[kv_set][l];
++                for (int h = 0; h < Nkv; h++) {
++                    size_t off = (size_t) h * ck->nb[2] + (size_t) (ar_len + N) * ck->nb[1];
++                    ggml_backend_tensor_set_async(n->backend, ck, zeros.data(), off, bytes);
++                    ggml_backend_tensor_set_async(n->backend, cv, zeros.data(), off, bytes);
++                }
++            }
++            ggml_backend_synchronize(n->backend);
++        }
++    } else {
++        if (!n->kv_buf || n->kv_keys != keys || n->kv_M != M) {
++            if (n->kv_buf) {
++                ggml_backend_buffer_free(n->kv_buf);
++                ggml_free(n->kv_ctx);
++                n->kv_buf = nullptr;
++                n->kv_ctx = nullptr;
++            }
++            struct ggml_init_params kp = { ggml_tensor_overhead() * (size_t) (c.n_layers * 2 + 4), NULL, true };
++            n->kv_ctx                  = ggml_init(kp);
++            for (int l = 0; l < c.n_layers; l++) {
++                n->kv_k[l] = ggml_new_tensor_4d(n->kv_ctx, GGML_TYPE_F16, D, keys, Nkv, M);
++                n->kv_v[l] = ggml_new_tensor_4d(n->kv_ctx, GGML_TYPE_F16, D, keys, Nkv, M);
++            }
++            n->kv_buf = ggml_backend_alloc_ctx_tensors(n->kv_ctx, n->backend);
++            if (!n->kv_buf) {
++                fprintf(stderr, "[NAR] FATAL: failed to allocate NAR KV buffer\n");
++                return false;
++            }
++            n->kv_keys = keys;
++            n->kv_M    = M;
++        }
++        ggml_backend_buffer_clear(n->kv_buf, 0);
++        // Copy/dequant AR prefix [0..ar_len) into n->kv_k/v once on GPU
++        size_t                  pmem = ggml_tensor_overhead() * (size_t) (c.n_layers * 16 + 32) +
++                      ggml_graph_overhead_custom((size_t) (c.n_layers * 16 + 32), false);
++        struct ggml_init_params pp = { pmem, NULL, true };
++        struct ggml_context *   pc = ggml_init(pp);
++        struct ggml_cgraph *    pg = ggml_new_graph_custom(pc, c.n_layers * 16 + 32, false);
++        for (int l = 0; l < c.n_layers; l++) {
++            struct ggml_tensor * ck   = kv->k[kv_set][l];
++            struct ggml_tensor * cv   = kv->v[kv_set][l];
++            struct ggml_tensor * k_ar = ggml_view_3d(pc, ck, D, ar_len, Nkv, ck->nb[1], ck->nb[2], 0);
++            struct ggml_tensor * v_ar = ggml_view_3d(pc, cv, D, ar_len, Nkv, cv->nb[1], cv->nb[2], 0);
++            if (ck->type != GGML_TYPE_F16) {
++                k_ar = ggml_cast(pc, k_ar, GGML_TYPE_F32);
++                v_ar = ggml_cast(pc, v_ar, GGML_TYPE_F32);
++            }
++            for (int m = 0; m < M; m++) {
++                size_t               moff = (size_t) m * n->kv_k[l]->nb[3];
++                struct ggml_tensor * kdst =
++                    ggml_view_3d(pc, n->kv_k[l], D, ar_len, Nkv, n->kv_k[l]->nb[1], n->kv_k[l]->nb[2], moff);
++                struct ggml_tensor * vdst =
++                    ggml_view_3d(pc, n->kv_v[l], D, ar_len, Nkv, n->kv_v[l]->nb[1], n->kv_v[l]->nb[2], moff);
++                ggml_build_forward_expand(pg, ggml_cpy(pc, k_ar, kdst));
++                ggml_build_forward_expand(pg, ggml_cpy(pc, v_ar, vdst));
++            }
++        }
++        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(n->backend));
++        ggml_gallocr_alloc_graph(ga, pg);
++        ggml_backend_graph_compute(n->backend, pg);
++        ggml_backend_synchronize(n->backend);
++        ggml_gallocr_free(ga);
++        ggml_free(pc);
++    }
++
++    // 2. Check if the static graph is already built for this exact shape & KV allocation
++    bool new_shape = (n->graph_T != T_lat || n->graph_ar != ar_len);
++    bool need_build = !n->graph_built || new_shape || n->graph_M != M || n->graph_set != kv_set ||
++                      n->graph_kv_epoch != kv->epoch || n->graph_dbg != dbg_enabled ||
++                      n->graph_inplace_kv != can_inplace;
++    if (!need_build) {
++        return true;
++    }
++
++    static_graph_release(&n->static_graph, n->sched);
++    n->graph_built = false;
++
++    if (new_shape || !n->input_ctx) {
+         if (n->input_ctx) {
+             ggml_backend_buffer_free(n->input_buf);
+             ggml_free(n->input_ctx);
+@@ -375,48 +528,82 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
+         n->input_ctx               = ggml_init(ip);
+         n->in_pos_emb              = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F32, H, N);
+         n->in_pos                  = ggml_new_tensor_1d(n->input_ctx, GGML_TYPE_I32, N);
+-        int mask_rows              = (N + YUE2_NAR_MASK_PAD - 1) / YUE2_NAR_MASK_PAD * YUE2_NAR_MASK_PAD;
+-        int keys                   = (ar_len + N + YUE2_NAR_KV_PAD - 1) / YUE2_NAR_KV_PAD * YUE2_NAR_KV_PAD;
+-        n->in_mask                 = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F16, keys, mask_rows);
+-        n->in_kv_zero              = nullptr;
+-        if (keys > ar_len + N) {
+-            n->in_kv_zero = ggml_new_tensor_4d(n->input_ctx, GGML_TYPE_F16, c.head_dim, keys - ar_len - N, c.n_kv_heads, 1);
+-            ggml_set_name(n->in_kv_zero, "nar_kv_zero");
+-            ggml_set_input(n->in_kv_zero);
++        if (no_mask) {
++            n->in_mask = nullptr;
++        } else {
++            // With CUDA FlashAttention, a 1-row mask [keys, 1] is broadcast across all queries (21 KB in L1 vs 93 MB!).
++            const bool one_row_mask = n->use_flash_attn && !std::getenv("YUE_NAR_FULL_MASK");
++            int mask_rows = one_row_mask ? 1 : (N + YUE2_NAR_MASK_PAD - 1) / YUE2_NAR_MASK_PAD * YUE2_NAR_MASK_PAD;
++            n->in_mask    = ggml_new_tensor_2d(n->input_ctx, GGML_TYPE_F16, keys, mask_rows);
++            ggml_set_name(n->in_mask, "nar_mask");
++            ggml_set_input(n->in_mask);
+         }
++        n->in_kv_zero = nullptr;
+         ggml_set_name(n->in_pos_emb, "nar_pos_emb");
+         ggml_set_input(n->in_pos_emb);
+         ggml_set_name(n->in_pos, "nar_positions");
+         ggml_set_input(n->in_pos);
+-        ggml_set_name(n->in_mask, "nar_mask");
+-        ggml_set_input(n->in_mask);
+ 
+         n->input_buf = ggml_backend_alloc_ctx_tensors(n->input_ctx, n->backend);
+         if (!n->input_buf) {
+             fprintf(stderr, "[NAR] FATAL: failed to allocate input buffer\n");
+             return false;
+         }
++
++        n->scratch_pos_emb.resize((size_t) H * N);
++        nar_pos_features(N, H, n->scratch_pos_emb.data());
++        ggml_backend_tensor_set(n->in_pos_emb, n->scratch_pos_emb.data(), 0, n->scratch_pos_emb.size() * sizeof(float));
++
++        n->scratch_pos.resize(N);
++        for (int i = 0; i < N; i++) {
++            n->scratch_pos[i] = ar_len + i;
++        }
++        ggml_backend_tensor_set(n->in_pos, n->scratch_pos.data(), 0, n->scratch_pos.size() * sizeof(int32_t));
++
++        if (n->in_mask) {
++            std::vector<uint16_t> mask((size_t) ggml_nelements(n->in_mask), 0);
++            for (int64_t row = 0; row < n->in_mask->ne[1]; row++) {
++                for (int64_t key = ar_len + N; key < keys; key++) {
++                    mask[(size_t) (row * keys + key)] = 0xFC00;
++                }
++            }
++            ggml_backend_tensor_set(n->in_mask, mask.data(), 0, mask.size() * sizeof(uint16_t));
++        }
+     }
+ 
+-    // Latent projection, shared timestep embedding, frame embedding, the last
+-    // two broadcast over the variations
++    struct ggml_context * ctx = graph_arena_begin(&n->arena);
++    struct ggml_cgraph *  gf  = ggml_new_graph_custom(ctx, YUE2_NAR_GRAPH_NODES, false);
++
++    n->in_x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n->latent_dim, N, M);
++    ggml_set_name(n->in_x, "nar_x");
++    ggml_set_input(n->in_x);
++    n->in_time = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, YUE2_TIME_EMBED_DIM);
++    ggml_set_name(n->in_time, "nar_time");
++    ggml_set_input(n->in_time);
++
+     struct ggml_tensor * hidden = nar_linear_bias(ctx, n->vae2llm_w, n->vae2llm_b, n->in_x);
+     struct ggml_tensor * temb   = nar_linear_bias(ctx, n->time_w0, n->time_b0, n->in_time);
+     temb                        = nar_linear_bias(ctx, n->time_w1, n->time_b1, ggml_silu(ctx, temb));
+-    ggml_set_name(temb, "temb_t");
+-    ggml_set_output(temb);
++    if (dbg_enabled) {
++        ggml_set_name(temb, "temb_t");
++        ggml_set_output(temb);
++    }
+     hidden = ggml_add(ctx, hidden, temb);
+     hidden = ggml_add(ctx, hidden, n->in_pos_emb);
+-    ggml_set_name(hidden, "hidden_after_input");
+-    ggml_set_output(hidden);
++    if (dbg_enabled) {
++        ggml_set_name(hidden, "hidden_after_input");
++        ggml_set_output(hidden);
++    }
+ 
+     const int probes[] = YUE2_NAR_PROBE_LAYERS;
+     for (int l = 0; l < c.n_layers; l++) {
+         Qwen3Layer *         ly   = &n->layers[l];
+         struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
+-        struct ggml_tensor * attn = nar_build_attn(ctx, c, ly, norm, n->in_pos, n->in_mask, n->in_kv_zero, kv->k[kv_set][l],
+-                                                   kv->v[kv_set][l], ar_len, N, M, n->use_flash_attn, n->clamp_fp16);
+-        if (l == 0) {
++        struct ggml_tensor * kv_k = can_inplace ? kv->k[kv_set][l] : n->kv_k[l];
++        struct ggml_tensor * kv_v = can_inplace ? kv->v[kv_set][l] : n->kv_v[l];
++        struct ggml_tensor * attn = nar_build_attn(ctx, gf, c, ly, norm, n->in_pos, n->in_mask, kv_k, kv_v, ar_len, N,
++                                                   M, keys, n->use_flash_attn, n->clamp_fp16);
++        if (dbg_enabled && l == 0) {
+             ggml_set_name(attn, "layer0_sa_output");
+             ggml_set_output(attn);
+         }
+@@ -429,67 +616,58 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
+         if (n->clamp_fp16) {
+             hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+         }
+-        for (int probe : probes) {
+-            if (l == probe) {
+-                char name[64];
+-                snprintf(name, sizeof(name), "hidden_after_layer%d", l);
+-                ggml_set_name(hidden, name);
+-                ggml_set_output(hidden);
++        if (dbg_enabled) {
++            for (int probe : probes) {
++                if (l == probe) {
++                    char name[64];
++                    snprintf(name, sizeof(name), "hidden_after_layer%d", l);
++                    ggml_set_name(hidden, name);
++                    ggml_set_output(hidden);
++                }
+             }
+         }
+     }
+ 
+     hidden = qwen3_rms_norm(ctx, hidden, n->final_norm, c.rms_norm_eps);
+ 
+-    // Velocity head, then drop the LATENT_START and LATENT_END columns of
+-    // every variation
+     struct ggml_tensor * pred = nar_linear_bias(ctx, n->llm2vae_w, n->llm2vae_b, hidden);
+     n->out_v = ggml_cont(ctx, ggml_view_3d(ctx, pred, n->latent_dim, T_lat, M, pred->nb[1], pred->nb[2], pred->nb[1]));
+     ggml_set_name(n->out_v, "nar_velocity");
+     ggml_set_output(n->out_v);
+     ggml_build_forward_expand(gf, n->out_v);
+ 
+-    n->graph     = gf;
+-    n->graph_T   = T_lat;
+-    n->graph_M   = M;
+-    n->graph_ar  = ar_len;
+-    n->graph_set = kv_set;
++    if (!static_graph_alloc(&n->static_graph, n->backend, n->sched, gf)) {
++        fprintf(stderr, "[NAR] FATAL: static graph alloc failed for T_lat=%d\n", T_lat);
++        return false;
++    }
+ 
+-    if (new_shape) {
+-        n->scratch_pos_emb.resize((size_t) H * N);
+-        nar_pos_features(N, H, n->scratch_pos_emb.data());
+-        ggml_backend_tensor_set(n->in_pos_emb, n->scratch_pos_emb.data(), 0, n->scratch_pos_emb.size() * sizeof(float));
++    n->graph            = gf;
++    n->graph_T          = T_lat;
++    n->graph_M          = M;
++    n->graph_ar         = ar_len;
++    n->graph_set        = kv_set;
++    n->graph_kv_epoch   = kv->epoch;
++    n->graph_dbg        = dbg_enabled;
++    n->graph_inplace_kv = can_inplace;
++    n->graph_built      = true;
+ 
+-        n->scratch_pos.resize(N);
+-        for (int i = 0; i < N; i++) {
+-            n->scratch_pos[i] = ar_len + i;
+-        }
+-        ggml_backend_tensor_set(n->in_pos, n->scratch_pos.data(), 0, n->scratch_pos.size() * sizeof(int32_t));
+-
+-        // Every NAR query sees every real key: zero, and -inf (f16 0xFC00) on the padding
+-        const int64_t         keys = n->in_mask->ne[0];
+-        std::vector<uint16_t> mask((size_t) ggml_nelements(n->in_mask), 0);
+-        for (int64_t row = 0; row < n->in_mask->ne[1]; row++) {
+-            for (int64_t key = ar_len + N; key < keys; key++) {
+-                mask[(size_t) (row * keys + key)] = 0xFC00;
+-            }
+-        }
+-        ggml_backend_tensor_set(n->in_mask, mask.data(), 0, mask.size() * sizeof(uint16_t));
+-        if (n->in_kv_zero) {
+-            std::vector<uint16_t> zeros((size_t) ggml_nelements(n->in_kv_zero), 0);
+-            ggml_backend_tensor_set(n->in_kv_zero, zeros.data(), 0, zeros.size() * sizeof(uint16_t));
+-        }
+-    }
+-    if (new_key) {
+-        fprintf(stderr, "[NAR] Graph: %d nodes, T_lat=%d, variations=%d, prefix=%d, set=%d\n", ggml_graph_n_nodes(gf),
+-                T_lat, M, ar_len, kv_set);
+-    }
++    fprintf(stderr, "[NAR] Graph: %d nodes, T_lat=%d, variations=%d, prefix=%d, set=%d (direct=%d, inplace_kv=%d)\n",
++            ggml_graph_n_nodes(gf), T_lat, M, ar_len, kv_set, (int) n->static_graph.direct, (int) can_inplace);
+     return true;
+ }
+ 
+-// One velocity evaluation of M variations: x_t [M, T_lat, latent_dim] time
+-// major per variation, raw timestep shared. ar_len is the AR prefix length
+-// resident in set kv_set of the cache. Writes v in the layout of x_t.
++struct NarTimingStats {
++    double build_ms   = 0;
++    double alloc_ms   = 0;
++    double h2d_ms     = 0;
++    double compute_ms = 0;
++    double d2h_ms     = 0;
++    double stats_ms   = 0;
++    int    evals      = 0;
++};
++static NarTimingStats g_nar_timing = {};
++
++// One velocity evaluation of M variations using the pre-built StaticGraph.
+ static bool nar_velocity(Yue2NAR *            n,
+                          const Qw3lmKvCache * kv,
+                          const float *        x_t,
+@@ -499,19 +677,12 @@ static bool nar_velocity(Yue2NAR *            n,
+                          int                  kv_set,
+                          float                raw_t,
+                          float *              v_out) {
+-    if (!nar_build_graph(n, kv, T_lat, M, ar_len, kv_set)) {
+-        return false;
+-    }
+-
+-    // Every evaluation allocates the graph before uploading and computing:
+-    // the topology is identical so the allocation is stable and the backend
+-    // graph cache stays hot.
+-    ggml_backend_sched_reset(n->sched);
+-    if (!ggml_backend_sched_alloc_graph(n->sched, n->graph)) {
+-        fprintf(stderr, "[NAR] FATAL: graph alloc failed for T_lat=%d\n", T_lat);
+-        return false;
+-    }
++    (void) kv;
++    (void) ar_len;
++    (void) kv_set;
++    static const bool timing = std::getenv("YUE_TIMING") != nullptr;
+ 
++    Timer t2;
+     // LATENT_START and LATENT_END are zero rows around every variation
+     int    N     = T_lat + 2;
+     size_t block = (size_t) n->latent_dim * T_lat;
+@@ -525,13 +696,24 @@ static bool nar_velocity(Yue2NAR *            n,
+     float feats[YUE2_TIME_EMBED_DIM];
+     nar_time_features(nar_shift_t(n, raw_t), feats);
+     ggml_backend_tensor_set(n->in_time, feats, 0, sizeof(feats));
++    if (timing) g_nar_timing.h2d_ms += t2.ms();
+ 
+-    const enum ggml_status status = ggml_backend_sched_graph_compute(n->sched, n->graph);
++    Timer t3;
++    const enum ggml_status status = static_graph_compute(&n->static_graph, n->backend, n->sched, n->graph);
+     if (status != GGML_STATUS_SUCCESS) {
+         fprintf(stderr, "[NAR] FATAL: graph compute failed (status %d) for T_lat=%d\n", (int) status, T_lat);
+         return false;
+     }
++    if (timing) {
++        ggml_backend_synchronize(n->backend);
++        g_nar_timing.compute_ms += t3.ms();
++    }
++    Timer t4;
+     ggml_backend_tensor_get(n->out_v, v_out, 0, block * M * sizeof(float));
++    if (timing) {
++        g_nar_timing.d2h_ms += t4.ms();
++        g_nar_timing.evals++;
++    }
+     return true;
+ }
+ 
+@@ -582,6 +764,14 @@ static bool nar_solve(Yue2NAR *            n,
+     bool   opening     = true;
+     Timer  step_timer;
+ 
++    g_nar_timing = {};
++    {
++        Timer t_prep;
++        if (!nar_prepare_chunk(n, kv, T_lat, M, ar_len, kv_set, dbg && dbg->enabled)) {
++            return false;
++        }
++        g_nar_timing.build_ms += t_prep.ms();
++    }
+     debug_dump_2d(dbg, "noise", state, T_lat, n->latent_dim);
+     Timer solve_timer;
+     auto  velocity = [&](const float * x, float t, float * out) {
+@@ -595,7 +785,9 @@ static bool nar_solve(Yue2NAR *            n,
+         // One input does not always come out the same from the device: a
+         // velocity that is not finite is evaluated again before the song fails
+         for (int attempt = 1;; attempt++) {
++            Timer ts;
+             const FloatStats s = float_stats(out, count);
++            g_nar_timing.stats_ms += ts.ms();
+             if (!float_stats_bad(s)) {
+                 break;
+             }
+@@ -646,14 +838,32 @@ static bool nar_solve(Yue2NAR *            n,
+     fprintf(stderr, "[NAR] Solved: T_lat=%d, %d variations, %d steps (%s, %d evaluations), %.0f ms (%.1f ms/step)\n",
+             T_lat, M, steps, solver == YUE2_SOLVER_AB2 ? "ab2" : "midpoint", evaluations, solve_timer.ms(),
+             solve_timer.ms() / steps);
++    if (std::getenv("YUE_TIMING") != nullptr && g_nar_timing.evals > 0) {
++        double e = (double) g_nar_timing.evals;
++        fprintf(stderr,
++                "[NAR-TIMING] %d evals: build=%.1fms (%.2f/e) alloc=%.1fms (%.2f/e) h2d=%.1fms (%.2f/e) "
++                "compute=%.1fms (%.2f/e) d2h=%.1fms (%.2f/e) stats=%.1fms (%.2f/e)\n",
++                g_nar_timing.evals, g_nar_timing.build_ms, g_nar_timing.build_ms / e, g_nar_timing.alloc_ms,
++                g_nar_timing.alloc_ms / e, g_nar_timing.h2d_ms, g_nar_timing.h2d_ms / e, g_nar_timing.compute_ms,
++                g_nar_timing.compute_ms / e, g_nar_timing.d2h_ms, g_nar_timing.d2h_ms / e, g_nar_timing.stats_ms,
++                g_nar_timing.stats_ms / e);
++    }
+     return true;
+ }
+ 
+ static void nar_free(Yue2NAR * n) {
++    static_graph_release(&n->static_graph, n->sched);
+     if (n->arena.ctx) {
+-        ggml_backend_sched_reset(n->sched);
+         graph_arena_free(&n->arena);
+     }
++    if (n->kv_buf) {
++        ggml_backend_buffer_free(n->kv_buf);
++        ggml_free(n->kv_ctx);
++    }
++    if (n->f16_wbuf) {
++        ggml_backend_buffer_free(n->f16_wbuf);
++        ggml_free(n->f16_wctx);
++    }
+     if (n->input_ctx) {
+         ggml_backend_buffer_free(n->input_buf);
+         ggml_free(n->input_ctx);
+diff --git a/src/qwen3-enc.h b/src/qwen3-enc.h
+index f8d8ebf..5ec957f 100644
+--- a/src/qwen3-enc.h
++++ b/src/qwen3-enc.h
+@@ -152,7 +152,8 @@ static void qwen3_load_layer(WeightCtx *         wctx,
+     ly->k_norm = gf_load_tensor_f32(wctx, gf, prefix + ".self_attn.k_norm.weight");
+ 
+     // MLP: try gate+up fused, then separate
+-    ly->gate_up = gf_load_pair_fused(wctx, gf, prefix + ".mlp.gate_proj.weight", prefix + ".mlp.up_proj.weight");
++    ly->gate_up = std::getenv("YUE_NO_FUSE_GATE_UP") ? nullptr :
++        gf_load_pair_fused(wctx, gf, prefix + ".mlp.gate_proj.weight", prefix + ".mlp.up_proj.weight");
+     if (ly->gate_up) {
+         if (layer_idx == 0) {
+             fprintf(stderr, "[Qwen3] MLP: gate+up fused\n");
+diff --git a/src/qwen3-lm.h b/src/qwen3-lm.h
+index b57c3e6..65420b4 100644
+--- a/src/qwen3-lm.h
++++ b/src/qwen3-lm.h
+@@ -9,6 +9,7 @@
+ #include "graph-arena.h"
+ #include "qwen3-enc.h"  // Qwen3Layer, Qwen3Config, layer build helpers
+ #include "static-graph.h"
++#include "timer.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -680,6 +681,17 @@ static void qw3lm_forward(Qwen3LM *      m,
+ // kv_sets[N]: which KV set each token uses, always consecutive from kv_sets[0].
+ // logits: [N * rows] output, N logit vectors of the LM head rows
+ // [row0, row0 + rows) concatenated.
++struct ArTimingStats {
++    double build_ms   = 0;
++    double mask_ms    = 0;
++    double h2d_ms     = 0;
++    double compute_ms = 0;
++    double d2h_ms     = 0;
++    int    steps      = 0;
++    int    builds     = 0;
++};
++static ArTimingStats g_ar_timing = {};
++
+ static void qw3lm_forward_batch(Qwen3LM *      m,
+                                 Qw3lmKvCache * kv,
+                                 const int *    token_ids,
+@@ -688,6 +700,7 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+                                 float *        logits,
+                                 int            row0,
+                                 int            rows) {
++    static const bool ar_timing = std::getenv("YUE_TIMING") != nullptr;
+     const Qwen3LMConfig & c   = m->cfg;
+     int                   D   = c.head_dim;
+     int                   Nh  = c.n_heads;
+@@ -726,6 +739,7 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+                             m->batch_graph.key_row0 != row0 || m->batch_graph.key_rows != rows ||
+                             m->batch_graph.key_kv != kv->epoch;
+     if (need_build) {
++        Timer t_bld;
+         static_graph_release(&m->batch_graph.graph, m->sched);
+         m->batch_graph.built      = false;
+         struct ggml_context * ctx = graph_arena_begin(&m->arena_batch);
+@@ -769,26 +783,20 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+             int                 kv_dim = Nkv * D;
+             if (ly->qkv) {
+                 struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, norm);
+-                q                        = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, N, qkv->nb[1], 0));
+-                k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
+-                v = ggml_cont(ctx,
+-                              ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
++                q = ggml_view_3d(ctx, qkv, D, Nh, N, (size_t) D * qkv->nb[0], qkv->nb[1], 0);
++                k = ggml_view_3d(ctx, qkv, D, Nkv, N, (size_t) D * qkv->nb[0], qkv->nb[1], (size_t) q_dim * qkv->nb[0]);
++                v = ggml_view_3d(ctx, qkv, D, Nkv, N, (size_t) D * qkv->nb[0], qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]);
+             } else if (ly->qk) {
+                 struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, norm);
+-                q                       = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, N, qk->nb[1], 0));
+-                k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, N, qk->nb[1], (size_t) q_dim * qk->nb[0]));
+-                v = qwen3_linear(ctx, ly->v_proj, norm);
++                q = ggml_view_3d(ctx, qk, D, Nh, N, (size_t) D * qk->nb[0], qk->nb[1], 0);
++                k = ggml_view_3d(ctx, qk, D, Nkv, N, (size_t) D * qk->nb[0], qk->nb[1], (size_t) q_dim * qk->nb[0]);
++                v = ggml_reshape_3d(ctx, qwen3_linear(ctx, ly->v_proj, norm), D, Nkv, N);
+             } else {
+-                q = qwen3_linear(ctx, ly->q_proj, norm);
+-                k = qwen3_linear(ctx, ly->k_proj, norm);
+-                v = qwen3_linear(ctx, ly->v_proj, norm);
++                q = ggml_reshape_3d(ctx, qwen3_linear(ctx, ly->q_proj, norm), D, Nh, N);
++                k = ggml_reshape_3d(ctx, qwen3_linear(ctx, ly->k_proj, norm), D, Nkv, N);
++                v = ggml_reshape_3d(ctx, qwen3_linear(ctx, ly->v_proj, norm), D, Nkv, N);
+             }
+ 
+-            // Reshape to heads: [D, Heads, N]
+-            q = ggml_reshape_3d(ctx, q, D, Nh, N);
+-            k = ggml_reshape_3d(ctx, k, D, Nkv, N);
+-            v = ggml_reshape_3d(ctx, v, D, Nkv, N);
+-
+             // QK-Norm (rms_norm on dim0=D, per head per seq)
+             q = ggml_rms_norm(ctx, q, c.rms_norm_eps);
+             q = ggml_mul(ctx, q, qwen3_f32(ctx, ly->q_norm));
+@@ -799,10 +807,11 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+             q = ggml_rope_ext(ctx, q, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+             k = ggml_rope_ext(ctx, k, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+ 
+-            // Contiguous for clean slicing
+-            q = ggml_cont(ctx, q);
+-            k = ggml_cont(ctx, k);
+-            v = ggml_cont(ctx, v);
++            // q and k are already contiguous outputs of ggml_rope_ext; v from fused qkv is
++            // already contiguous when N == 1 and only needs ggml_cont when N > 1.
++            if (N > 1 && !ggml_is_contiguous(v)) {
++                v = ggml_cont(ctx, v);
++            }
+ 
+             // Clamp V before F16 cast (sub-Ampere FP16 accumulation overflow)
+             if (m->clamp_fp16) {
+@@ -895,6 +904,10 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+         m->batch_graph.rows_data.resize((size_t) N);
+         m->batch_graph.mask_data.resize((size_t) n_kv_pad * (size_t) N);
+         m->batch_graph.built = true;
++        if (ar_timing) {
++            g_ar_timing.build_ms += t_bld.ms();
++            g_ar_timing.builds++;
++        }
+     } else {
+         gf          = m->batch_graph.gf;
+         token_ids_t = m->batch_graph.token_ids_t;
+@@ -904,6 +917,7 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+         lgt         = m->batch_graph.lgt;
+     }
+ 
++    Timer t_h2d;
+     // Set token IDs
+     ggml_backend_tensor_set(token_ids_t, token_ids, 0, N * sizeof(int));
+ 
+@@ -913,7 +927,9 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+     }
+     ggml_backend_tensor_set(positions, m->batch_graph.pos_data.data(), 0, (size_t) N * sizeof(int));
+     ggml_backend_tensor_set(kv_rows, m->batch_graph.rows_data.data(), 0, (size_t) N * sizeof(int64_t));
++    if (ar_timing) g_ar_timing.h2d_ms += t_h2d.ms();
+ 
++    Timer t_mask;
+     // Attention mask: [n_kv_pad, 1, 1, N] f16
+     // 0.0 for valid KV positions, neg inf past each element's kv_len,
+     // padded tail included
+@@ -935,10 +951,22 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
+     }
+     ggml_backend_tensor_set(attn_mask, m->batch_graph.mask_data.data(), 0,
+                             m->batch_graph.mask_data.size() * sizeof(uint16_t));
++    if (ar_timing) g_ar_timing.mask_ms += t_mask.ms();
++
++    Timer t_comp;
+     static_graph_compute(&m->batch_graph.graph, m->backend, m->sched, gf);
++    if (ar_timing) {
++        ggml_backend_synchronize(m->backend);
++        g_ar_timing.compute_ms += t_comp.ms();
++    }
+ 
++    Timer t_d2h;
+     // Read logits [rows, N]
+     ggml_backend_tensor_get(lgt, logits, 0, (size_t) rows * N * sizeof(float));
++    if (ar_timing) {
++        g_ar_timing.d2h_ms += t_d2h.ms();
++        g_ar_timing.steps++;
++    }
+ 
+     // Advance all KV positions. The arena and the sched allocation
+     // persist into the next forward.
+diff --git a/src/sampling.h b/src/sampling.h
+index 3d59e92..887fb59 100644
+--- a/src/sampling.h
++++ b/src/sampling.h
+@@ -85,28 +85,27 @@ static void yue2_distribution(const float *                logits,
+                               std::vector<Yue2Candidate> & out) {
+     int lo, hi, end;
+     yue2_phase_range(phase, &lo, &hi, &end);
+-    int row0 = end < lo ? end : lo;  // first row of the head window of the phase
++    int row0    = end < lo ? end : lo;  // first row of the head window of the phase
++    int n_range = hi - lo;
++    const float * range_logits = logits + (lo - row0);
+ 
+-    // The candidate of id sits at index id - lo until the truncations below
+-    out.clear();
+-    out.reserve((size_t) (hi - lo) + 1);
+-    for (int id = lo; id < hi; id++) {
+-        out.push_back({ id, logits[id - row0] });
+-    }
+-    if (step >= s.min_tokens) {
+-        out.push_back({ end, logits[end - row0] });
+-    }
+-
+-    // The ids of the penalty window scale by their frequency in it, negatives
+-    // multiplied and positives divided. The history only holds content ids of
+-    // the phase, and an id is scored at its first occurrence in the window.
+-    if (s.repetition_penalty != 1.0f) {
++    // Collect the <= penalty_window unique penalized ids and their exact penalized scores.
++    struct PenEntry {
++        int   id;
++        float score;
++    };
++    PenEntry pen[104];
++    int      n_pen = 0;
++    if (s.repetition_penalty != 1.0f && !history.empty()) {
+         size_t first = history.size() > (size_t) s.penalty_window ? history.size() - (size_t) s.penalty_window : 0;
+         for (size_t i = first; i < history.size(); i++) {
+             int  id   = history[i];
+             bool seen = false;
+-            for (size_t j = first; j < i && !seen; j++) {
+-                seen = history[j] == id;
++            for (int p = 0; p < n_pen; p++) {
++                if (pen[p].id == id) {
++                    seen = true;
++                    break;
++                }
+             }
+             if (seen) {
+                 continue;
+@@ -115,41 +114,161 @@ static void yue2_distribution(const float *                logits,
+             for (size_t j = i; j < history.size(); j++) {
+                 freq += history[j] == id;
+             }
+-            float   alpha = powf(s.repetition_penalty, (float) freq);
+-            float & score = out[(size_t) (id - lo)].score;
+-            score         = score < 0.0f ? score * alpha : score / alpha;
++            float alpha = powf(s.repetition_penalty, (float) freq);
++            float sc    = range_logits[id - lo];
++            sc          = sc < 0.0f ? sc * alpha : sc / alpha;
++            pen[n_pen++] = { id, sc };
+         }
+     }
+-    if (s.temperature != 0.0f && s.temperature != 1.0f) {
+-        for (size_t i = 0; i < out.size(); i++) {
+-            out[i].score /= s.temperature;
++
++    auto is_penalized = [&](int id) -> bool {
++        for (int p = 0; p < n_pen; p++) {
++            if (pen[p].id == id) {
++                return true;
++            }
+         }
+-    }
++        return false;
++    };
++
++    const bool  scale_temp = (s.temperature != 0.0f && s.temperature != 1.0f);
++    const float inv_t      = scale_temp ? s.temperature : 1.0f;
++    auto        scale_sc   = [&](float v) -> float { return scale_temp ? (v / inv_t) : v; };
+ 
+     if (s.temperature == 0.0f) {
+-        size_t best = 0;
+-        for (size_t i = 1; i < out.size(); i++) {
+-            if (out[i].score > out[best].score) {
+-                best = i;
++        int   best_id = -1;
++        float best_sc = -INFINITY;
++        for (int i = 0; i < n_range; i++) {
++            float sc = range_logits[i];
++            if (sc > best_sc) {
++                if (n_pen > 0 && is_penalized(lo + i)) {
++                    continue;
++                }
++                best_sc = sc;
++                best_id = lo + i;
++            }
++        }
++        for (int p = 0; p < n_pen; p++) {
++            if (pen[p].score > best_sc || (pen[p].score == best_sc && best_id < 0)) {
++                best_sc = pen[p].score;
++                best_id = pen[p].id;
+             }
+         }
+-        Yue2Candidate winner = out[best];
+-        out.assign(1, winner);
++        if (step >= s.min_tokens) {
++            float es = logits[end - row0];
++            if (es > best_sc) {
++                best_sc = es;
++                best_id = end;
++            }
++        }
++        out.assign(1, { best_id, best_sc });
+         return;
+     }
+ 
+-    // top-k keeps every candidate at or above the k-th score, ties included
+-    int k = s.top_k < (int) out.size() ? s.top_k : (int) out.size();
+-    std::partial_sort(out.begin(), out.begin() + k, out.end(),
+-                      [](const Yue2Candidate & a, const Yue2Candidate & b) { return a.score > b.score; });
+-    float  threshold = out[k - 1].score;
+-    size_t kept      = 0;
+-    for (size_t i = 0; i < out.size(); i++) {
+-        if (out[i].score >= threshold) {
+-            out[kept++] = out[i];
++    // Fast single-pass top-k selection on raw floats:
++    // Maintain a min-heap of the top-k unpenalized scores in a stack buffer (no heap alloc).
++    // 99.9% of logits fail the threshold test on a single comparison; ties at threshold
++    // are tracked in-pass so no second scan over 151k logits is needed.
++    int total_cands = n_range + (step >= s.min_tokens ? 1 : 0);
++    int k           = s.top_k < total_cands ? s.top_k : total_cands;
++
++    Yue2Candidate              stack_heap[64];
++    std::vector<Yue2Candidate> dyn_heap;
++    Yue2Candidate *            heap_ptr = stack_heap;
++    if (k > 64) {
++        dyn_heap.resize((size_t) k);
++        heap_ptr = dyn_heap.data();
++    }
++    int  heap_sz  = 0;
++    auto heap_cmp = [](const Yue2Candidate & a, const Yue2Candidate & b) { return a.score > b.score; };
++
++    auto heap_insert = [&](Yue2Candidate c) {
++        if (heap_sz < k) {
++            heap_ptr[heap_sz++] = c;
++            if (heap_sz == k) {
++                std::make_heap(heap_ptr, heap_ptr + k, heap_cmp);
++            }
++        } else if (c.score > heap_ptr[0].score) {
++            std::pop_heap(heap_ptr, heap_ptr + k, heap_cmp);
++            heap_ptr[k - 1] = c;
++            std::push_heap(heap_ptr, heap_ptr + k, heap_cmp);
+         }
++    };
++
++    for (int p = 0; p < n_pen; p++) {
++        heap_insert({ pen[p].id, pen[p].score });
+     }
+-    out.resize(kept);
++    if (step >= s.min_tokens) {
++        heap_insert({ end, logits[end - row0] });
++    }
++
++    float thresh    = (heap_sz < k) ? -INFINITY : heap_ptr[0].score;
++    float tie_guard = (heap_sz < k) ? -INFINITY : (scale_temp ? std::nextafter(thresh, -INFINITY) : thresh);
++    bool  saw_tie   = false;
++    float max_tie   = -INFINITY;
++
++    for (int i = 0; i < n_range; i++) {
++        float sc = range_logits[i];
++        if (sc < tie_guard) {
++            continue;
++        }
++        int id = lo + i;
++        if (n_pen > 0 && is_penalized(id)) {
++            continue;
++        }
++        if (sc > thresh || heap_sz < k) {
++            heap_insert({ id, sc });
++            if (heap_sz == k) {
++                thresh    = heap_ptr[0].score;
++                tie_guard = scale_temp ? std::nextafter(thresh, -INFINITY) : thresh;
++            }
++        } else {
++            saw_tie = true;
++            if (sc > max_tie) {
++                max_tie = sc;
++            }
++        }
++    }
++
++    const float raw_thresh    = heap_ptr[0].score;
++    const float scaled_thresh = scale_sc(raw_thresh);
++    const float tie_lo        = scale_temp ? std::nextafter(raw_thresh, -INFINITY) : raw_thresh;
++    out.clear();
++    out.reserve((size_t) heap_sz + 8);
++    for (int i = 0; i < heap_sz; i++) {
++        out.push_back({ heap_ptr[i].id, scale_sc(heap_ptr[i].score) });
++    }
++    auto in_out = [&](int id) -> bool {
++        for (const auto & c : out) {
++            if (c.id == id) {
++                return true;
++            }
++        }
++        return false;
++    };
++    // Only scan for exact threshold ties if we actually saw a skipped element >= tie_lo
++    if (saw_tie && max_tie >= tie_lo) {
++        for (int i = 0; i < n_range; i++) {
++            float sc = range_logits[i];
++            if (sc >= tie_lo && sc <= raw_thresh) {
++                int id = lo + i;
++                if ((n_pen == 0 || !is_penalized(id)) && scale_sc(sc) >= scaled_thresh && !in_out(id)) {
++                    out.push_back({ id, scale_sc(sc) });
++                }
++            }
++        }
++    }
++    for (int p = 0; p < n_pen; p++) {
++        if (pen[p].score >= tie_lo && scale_sc(pen[p].score) >= scaled_thresh && !in_out(pen[p].id)) {
++            out.push_back({ pen[p].id, scale_sc(pen[p].score) });
++        }
++    }
++    if (step >= s.min_tokens) {
++        float es = logits[end - row0];
++        if (es >= tie_lo && scale_sc(es) >= scaled_thresh && !in_out(end)) {
++            out.push_back({ end, scale_sc(es) });
++        }
++    }
++
+     std::sort(out.begin(), out.end(),
+               [](const Yue2Candidate & a, const Yue2Candidate & b) { return a.score > b.score; });
+ 
